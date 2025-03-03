@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,11 +26,38 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.material.*
-import androidx.compose.runtime.*
+import androidx.compose.material.AlertDialog
+import androidx.compose.material.Button
+import androidx.compose.material.ExperimentalMaterialApi
+import androidx.compose.material.ExtendedFloatingActionButton
+import androidx.compose.material.Icon
+import androidx.compose.material.MaterialTheme
+import androidx.compose.material.OutlinedTextField
+import androidx.compose.material.Scaffold
+import androidx.compose.material.Surface
+import androidx.compose.material.Text
+import androidx.compose.material.rememberScaffoldState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.livedata.observeAsState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -48,6 +75,7 @@ import io.livekit.android.room.Room
 import io.livekit.android.room.participant.Participant
 import io.livekit.android.sample.CallViewModel
 import io.livekit.android.sample.common.R
+import io.livekit.android.sample.model.StressTest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.parcelize.Parcelize
@@ -62,6 +90,7 @@ class CallActivity : AppCompatActivity() {
             token = args.token,
             e2ee = args.e2eeOn,
             e2eeKey = args.e2eeKey,
+            stressTest = args.stressTest,
             application = application,
         )
     }
@@ -107,7 +136,9 @@ class CallActivity : AppCompatActivity() {
                 onSendMessage = { viewModel.sendData(it) },
                 onSimulateMigration = { viewModel.simulateMigration() },
                 onSimulateNodeFailure = { viewModel.simulateNodeFailure() },
+                onSimulateLeaveFullReconnect = { viewModel.simulateServerLeaveFullReconnect() },
                 fullReconnect = { viewModel.reconnect() },
+                onUpdateAttribute = { k, v -> viewModel.updateAttribute(k, v) },
             )
         }
     }
@@ -136,7 +167,11 @@ class CallActivity : AppCompatActivity() {
         screenCaptureIntentLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
     }
 
-    val previewParticipant = Participant("asdf", "asdf", Dispatchers.Main)
+    val previewParticipant = Participant(
+        Participant.Sid("asdf"),
+        Participant.Identity("asdf"),
+        Dispatchers.Main,
+    )
 
     @ExperimentalMaterialApi
     @Preview(showBackground = true, showSystemUi = true)
@@ -158,6 +193,8 @@ class CallActivity : AppCompatActivity() {
         onSimulateMigration: () -> Unit = {},
         onSimulateNodeFailure: () -> Unit = {},
         fullReconnect: () -> Unit = {},
+        onSimulateLeaveFullReconnect: () -> Unit = {},
+        onUpdateAttribute: (key: String, value: String) -> Unit = { _, _ -> },
     ) {
         AppTheme(darkTheme = true) {
             ConstraintLayout(
@@ -202,7 +239,7 @@ class CallActivity : AppCompatActivity() {
                     if (room != null) {
                         items(
                             count = participants.size,
-                            key = { index -> participants[index].sid },
+                            key = { index -> participants[index].sid.value },
                         ) { index ->
                             ParticipantItem(
                                 room = room,
@@ -424,9 +461,11 @@ class CallActivity : AppCompatActivity() {
                         if (showDebugDialog) {
                             DebugMenuDialog(
                                 onDismissRequest = { showDebugDialog = false },
-                                simulateMigration = { onSimulateMigration() },
-                                simulateNodeFailure = { onSimulateNodeFailure() },
-                                fullReconnect = { fullReconnect() },
+                                simulateMigration = onSimulateMigration,
+                                simulateNodeFailure = onSimulateNodeFailure,
+                                simulateLeaveFullReconnect = onSimulateLeaveFullReconnect,
+                                fullReconnect = fullReconnect,
+                                onUpdateAttribute = onUpdateAttribute,
                             )
                         }
                     }
@@ -474,5 +513,6 @@ class CallActivity : AppCompatActivity() {
         val token: String,
         val e2eeKey: String,
         val e2eeOn: Boolean,
+        val stressTest: StressTest,
     ) : Parcelable
 }

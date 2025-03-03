@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2025 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 package io.livekit.android.room.track
 
-import org.webrtc.RtpParameters
+import livekit.org.webrtc.RtpParameters
 
 data class LocalVideoTrackOptions(
     val isScreencast: Boolean = false,
@@ -26,13 +26,30 @@ data class LocalVideoTrackOptions(
      */
     val deviceId: String? = null,
     val position: CameraPosition? = CameraPosition.FRONT,
-    val captureParams: VideoCaptureParameter = VideoPreset169.QHD.capture,
+    val captureParams: VideoCaptureParameter = VideoPreset169.H720.capture,
 )
 
-data class VideoCaptureParameter(
+data class VideoCaptureParameter
+@JvmOverloads
+constructor(
+    /**
+     * Desired width.
+     */
     val width: Int,
+    /**
+     * Desired height.
+     */
     val height: Int,
+    /**
+     * Capture frame rate.
+     */
     val maxFps: Int,
+    /**
+     * Sometimes the capturer may not support the exact desired dimensions requested.
+     * If this is enabled, it will scale down and crop the captured frames to the
+     * same aspect ratio as [width]:[height].
+     */
+    val adaptOutputToDimensions: Boolean = true,
 )
 
 data class VideoEncoding(
@@ -68,7 +85,7 @@ enum class VideoCodec(val codecName: String) {
 
     companion object {
         fun fromCodecName(codecName: String): VideoCodec {
-            return VideoCodec.values().first { it.codecName.equals(codecName, ignoreCase = true) }
+            return entries.first { it.codecName.equals(codecName, ignoreCase = true) }
         }
     }
 }
@@ -126,36 +143,6 @@ enum class VideoPreset169(
         VideoCaptureParameter(3840, 2160, 30),
         VideoEncoding(8_000_000, 30),
     ),
-
-    @Deprecated("QVGA is deprecated, use H180 instead")
-    QVGA(
-        VideoCaptureParameter(320, 180, 15),
-        VideoEncoding(125_000, 15),
-    ),
-
-    @Deprecated("VGA is deprecated, use H360 instead")
-    VGA(
-        VideoCaptureParameter(640, 360, 30),
-        VideoEncoding(400_000, 30),
-    ),
-
-    @Deprecated("QHD is deprecated, use H540 instead")
-    QHD(
-        VideoCaptureParameter(960, 540, 30),
-        VideoEncoding(800_000, 30),
-    ),
-
-    @Deprecated("HD is deprecated, use H720 instead")
-    HD(
-        VideoCaptureParameter(1280, 720, 30),
-        VideoEncoding(2_500_000, 30),
-    ),
-
-    @Deprecated("FHD is deprecated, use H1080 instead")
-    FHD(
-        VideoCaptureParameter(1920, 1080, 30),
-        VideoEncoding(4_000_000, 30),
-    ),
 }
 
 /**
@@ -201,34 +188,49 @@ enum class VideoPreset43(
         VideoCaptureParameter(1920, 1440, 30),
         VideoEncoding(3_800_000, 30),
     ),
+}
 
-    @Deprecated("QVGA is deprecated, use H120 instead")
-    QVGA(
-        VideoCaptureParameter(240, 180, 15),
-        VideoEncoding(100_000, 15),
+/**
+ * 16:9 Video presets along with suggested bitrates.
+ */
+enum class ScreenSharePresets(
+    override val capture: VideoCaptureParameter,
+    override val encoding: VideoEncoding,
+) : VideoPreset {
+    H360_FPS3(
+        VideoCaptureParameter(640, 360, 3),
+        VideoEncoding(200_000, 3),
     ),
-
-    @Deprecated("VGA is deprecated, use H360 instead")
-    VGA(
-        VideoCaptureParameter(480, 360, 30),
-        VideoEncoding(320_000, 30),
+    H360_FPS15(
+        VideoCaptureParameter(640, 360, 15),
+        VideoEncoding(400_000, 15),
     ),
-
-    @Deprecated("QHD is deprecated, use H540 instead")
-    QHD(
-        VideoCaptureParameter(720, 540, 30),
-        VideoEncoding(640_000, 30),
+    H720_FPS5(
+        VideoCaptureParameter(1280, 720, 5),
+        VideoEncoding(800_000, 5),
     ),
-
-    @Deprecated("HD is deprecated, use H720 instead")
-    HD(
-        VideoCaptureParameter(960, 720, 30),
+    H720_FPS15(
+        VideoCaptureParameter(1280, 720, 15),
+        VideoEncoding(1_500_000, 15),
+    ),
+    H720_FPS30(
+        VideoCaptureParameter(1280, 720, 30),
         VideoEncoding(2_000_000, 30),
     ),
-
-    @Deprecated("FHD is deprecated, use H1080 instead")
-    FHD(
-        VideoCaptureParameter(1440, 1080, 30),
-        VideoEncoding(3_200_000, 30),
+    H1080_FPS15(
+        VideoCaptureParameter(1920, 1080, 15),
+        VideoEncoding(2_500_000, 15),
     ),
+    H1080_FPS30(
+        VideoCaptureParameter(1920, 1080, 30),
+        VideoEncoding(5_000_000, 30),
+    ),
+
+    /**
+     * Uses the original resolution without resizing.
+     */
+    ORIGINAL(
+        VideoCaptureParameter(0, 0, 30, adaptOutputToDimensions = false),
+        VideoEncoding(7_000_000, 30),
+    )
 }

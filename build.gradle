@@ -23,10 +23,9 @@ buildscript {
 apply plugin: 'io.codearte.nexus-staging'
 
 subprojects {
-    repositories {
-        google()
-        mavenCentral()
-        maven { url 'https://jitpack.io' }
+    // Ignore examples folder, it's not a module itself.
+    if (project.name == "examples") {
+        return
     }
 
     apply plugin: "com.diffplug.spotless"
@@ -53,16 +52,33 @@ subprojects {
             // through git history (see "license" section below)
             licenseHeaderFile rootProject.file("LicenseHeaderFile.txt")
             removeUnusedImports()
+            toggleOffOn()
         }
         kotlin {
             target("src/*/java/**/*.kt")
+            targetExclude(
+                "src/*/java/**/ReentrantMutex.kt", // Different license
+                "src/*/java/**/TextureViewRenderer.kt", // Different license
+                "src/*/java/**/FlowDelegate.kt", // Different license
+            )
             ktlint("0.50.0")
                 .setEditorConfigPath("$rootDir/.editorconfig")
             licenseHeaderFile(rootProject.file("LicenseHeaderFile.txt"))
                 .named('license')
             endWithNewline()
+            toggleOffOn()
         }
     }
+
+    // From Gradle 8 onwards, Kapt no longer automatically picks up jvmTarget
+    // from normal KotlinOptions. Must be manually set.
+    // JvmToolchain should not be used since it changes the actual JDK used.
+    tasks.withType(org.jetbrains.kotlin.gradle.tasks.KaptGenerateStubs).configureEach {
+        kotlinOptions {
+            jvmTarget = java_version
+        }
+    }
+
 }
 
 task clean(type: Delete) {

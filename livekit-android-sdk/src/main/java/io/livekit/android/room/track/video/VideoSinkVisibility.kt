@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,7 +32,14 @@ import java.util.Observable
  * is used.
  */
 abstract class VideoSinkVisibility : Observable() {
+    /**
+     * @return whether this VideoSink is visible or not.
+     */
     abstract fun isVisible(): Boolean
+
+    /**
+     * @return the dimensions of this VideoSink.
+     */
     abstract fun size(): Track.Dimensions
 
     /**
@@ -70,6 +77,10 @@ class ViewVisibility(private val view: View) : VideoSinkVisibility() {
         scheduleRecalculate()
     }
 
+    /**
+     * Declares that this [View] will override [View.onVisibilityChanged] and call through to [recalculate],
+     * partaking in the [VideoSinkVisibility] system.
+     */
     interface Notifier {
         var viewVisibility: ViewVisibility?
     }
@@ -96,6 +107,9 @@ class ViewVisibility(private val view: View) : VideoSinkVisibility() {
         )
     }
 
+    /**
+     * Recalculates whether this view's visibility has changed, and notifies observers if it has.
+     */
     fun recalculate() {
         var shouldNotify = false
         val newVisibility = isVisible()

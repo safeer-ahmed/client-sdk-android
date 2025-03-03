@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2025 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,35 +19,53 @@
 package io.livekit.android.room
 
 import android.content.Context
-import android.net.ConnectivityManager
+import android.net.ConnectivityManager.NetworkCallback
 import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import androidx.annotation.VisibleForTesting
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
 import io.livekit.android.ConnectOptions
+import io.livekit.android.LiveKit
+import io.livekit.android.LiveKitOverrides
 import io.livekit.android.RoomOptions
 import io.livekit.android.Version
 import io.livekit.android.audio.AudioHandler
+import io.livekit.android.audio.AudioProcessingController
+import io.livekit.android.audio.AudioSwitchHandler
+import io.livekit.android.audio.AuthedAudioProcessingController
+import io.livekit.android.audio.CommunicationWorkaround
 import io.livekit.android.dagger.InjectionNames
 import io.livekit.android.e2ee.E2EEManager
+import io.livekit.android.e2ee.E2EEOptions
 import io.livekit.android.events.*
 import io.livekit.android.memory.CloseableManager
 import io.livekit.android.renderer.TextureViewRenderer
+import io.livekit.android.room.metrics.collectMetrics
+import io.livekit.android.room.network.NetworkCallbackManagerFactory
 import io.livekit.android.room.participant.*
+import io.livekit.android.room.provisions.LKObjects
 import io.livekit.android.room.track.*
+import io.livekit.android.room.types.toSDKType
+import io.livekit.android.room.util.ConnectionWarmer
 import io.livekit.android.util.FlowObservable
 import io.livekit.android.util.LKLog
+import io.livekit.android.util.flow
 import io.livekit.android.util.flowDelegate
 import io.livekit.android.util.invoke
-import io.livekit.android.webrtc.createStatsGetter
 import io.livekit.android.webrtc.getFilteredStats
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.Serializable
 import livekit.LivekitModels
 import livekit.LivekitRtc
-import org.webrtc.*
+import livekit.org.webrtc.*
+import livekit.org.webrtc.audio.AudioDeviceModule
+import java.net.URI
+import java.util.Date
 import javax.inject.Named
 
 class Room
@@ -56,15 +74,36 @@ constructor(
     @Assisted private val context: Context,
     private val engine: RTCEngine,
     private val eglBase: EglBase,
-    private val localParticipantFactory: LocalParticipant.Factory,
+    localParticipantFactory: LocalParticipant.Factory,
     private val defaultsManager: DefaultsManager,
     @Named(InjectionNames.DISPATCHER_DEFAULT)
     private val defaultDispatcher: CoroutineDispatcher,
     @Named(InjectionNames.DISPATCHER_IO)
     private val ioDispatcher: CoroutineDispatcher,
+    /**
+     * The [AudioHandler] for setting up the audio as need.
+     *
+     * By default, this is an instance of [AudioSwitchHandler].
+     *
+     * This can be substituted for your own custom implementation through
+     * [LiveKitOverrides.audioOptions] when creating the room with [LiveKit.create].
+     *
+     * @see [audioSwitchHandler]
+     * @see [AudioSwitchHandler]
+     */
     val audioHandler: AudioHandler,
     private val closeableManager: CloseableManager,
     private val e2EEManagerFactory: E2EEManager.Factory,
+    private val communicationWorkaround: CommunicationWorkaround,
+    val audioProcessingController: AudioProcessingController,
+    /**
+     * A holder for objects that are used internally within LiveKit.
+     */
+    val lkObjects: LKObjects,
+    networkCallbackManagerFactory: NetworkCallbackManagerFactory,
+    private val audioDeviceModule: AudioDeviceModule,
+    private val regionUrlProviderFactory: RegionUrlProvider.Factory,
+    private val connectionWarmer: ConnectionWarmer,
 ) : RTCEngine.Listener, ParticipantListener {
 
     private lateinit var coroutineScope: CoroutineScope
@@ -90,17 +129,35 @@ constructor(
         NODE_FAILURE,
         MIGRATION,
         SERVER_LEAVE,
+        SERVER_LEAVE_FULL_RECONNECT,
     }
 
+    @Serializable
     @JvmInline
     value class Sid(val sid: String)
 
-    @Deprecated("Use events instead.")
-    var listener: RoomListener? = null
-
+    /**
+     * The session id of the room.
+     *
+     * Note: the sid may not be populated immediately upon [connect],
+     * so using the suspend function [getSid] or listening to the flow
+     * `room::sid.flow` is highly advised.
+     */
     @FlowObservable
     @get:FlowObservable
     var sid: Sid? by flowDelegate(null)
+        private set
+
+    /**
+     * Gets the sid of the room.
+     *
+     * If the sid is not yet available, will suspend until received.
+     */
+    suspend fun getSid(): Sid {
+        return this@Room::sid.flow
+            .filterNotNull()
+            .first()
+    }
 
     @FlowObservable
     @get:FlowObservable
@@ -112,8 +169,16 @@ constructor(
     var state: State by flowDelegate(State.DISCONNECTED) { new, old ->
         if (new != old) {
             when (new) {
-                State.CONNECTING -> audioHandler.start()
-                State.DISCONNECTED -> audioHandler.stop()
+                State.CONNECTING -> {
+                    audioHandler.start()
+                    communicationWorkaround.start()
+                }
+
+                State.DISCONNECTED -> {
+                    audioHandler.stop()
+                    communicationWorkaround.stop()
+                }
+
                 else -> {}
             }
         }
@@ -129,6 +194,12 @@ constructor(
     @get:FlowObservable
     var isRecording: Boolean by flowDelegate(false)
         private set
+
+    /**
+     * @suppress
+     */
+    @VisibleForTesting
+    var enableMetrics: Boolean = true
 
     /**
      *  end-to-end encryption manager
@@ -148,6 +219,11 @@ constructor(
     var adaptiveStream: Boolean = false
 
     /**
+     *  audio processing is enabled
+     */
+    var audioProcessorIsEnabled: Boolean = false
+
+    /**
      * Dynamically pauses video layers that are not being consumed by any subscribers,
      * significantly reducing publishing CPU and bandwidth usage.
      *
@@ -161,6 +237,13 @@ constructor(
         set(value) {
             localParticipant.dynacast = value
         }
+
+    /**
+     * Options for end-to-end encryption. Must be setup prior to [connect].
+     *
+     * If null, e2ee will be disabled.
+     */
+    var e2eeOptions: E2EEOptions? = null
 
     /**
      * Default options to use when creating an audio track.
@@ -182,16 +265,36 @@ constructor(
      */
     var videoTrackPublishDefaults: VideoTrackPublishDefaults by defaultsManager::videoTrackPublishDefaults
 
+    /**
+     * Default options to use when creating a screen share track.
+     */
+    var screenShareTrackCaptureDefaults: LocalVideoTrackOptions by defaultsManager::screenShareTrackCaptureDefaults
+
+    /**
+     * Default options to use when publishing a screen share track.
+     */
+    var screenShareTrackPublishDefaults: VideoTrackPublishDefaults by defaultsManager::screenShareTrackPublishDefaults
+
     val localParticipant: LocalParticipant = localParticipantFactory.create(dynacast = false).apply {
         internalListener = this@Room
     }
 
-    private var mutableRemoteParticipants by flowDelegate(emptyMap<String, RemoteParticipant>())
+    private var mutableRemoteParticipants by flowDelegate(emptyMap<Participant.Identity, RemoteParticipant>())
 
     @FlowObservable
     @get:FlowObservable
-    val remoteParticipants: Map<String, RemoteParticipant>
+    val remoteParticipants: Map<Participant.Identity, RemoteParticipant>
         get() = mutableRemoteParticipants
+
+    /**
+     * A convenience getter for the audio handler as a [AudioSwitchHandler].
+     *
+     * Will return null if [audioHandler] is not a [AudioSwitchHandler].
+     */
+    val audioSwitchHandler: AudioSwitchHandler?
+        get() = audioHandler as? AudioSwitchHandler
+
+    private var sidToIdentity = mutableMapOf<Participant.Sid, Participant.Identity>()
 
     private var mutableActiveSpeakers by flowDelegate(emptyList<Participant>())
 
@@ -203,30 +306,308 @@ constructor(
     private var hasLostConnectivity: Boolean = false
     private var connectOptions: ConnectOptions = ConnectOptions()
 
+    private var stateLock = Mutex()
+
+    private var regionUrlProvider: RegionUrlProvider? = null
+    private var regionUrl: String? = null
+
+    private var transcriptionReceivedTimes = mutableMapOf<String, Long>()
+
     private fun getCurrentRoomOptions(): RoomOptions =
         RoomOptions(
             adaptiveStream = adaptiveStream,
             dynacast = dynacast,
+            e2eeOptions = e2eeOptions,
             audioTrackCaptureDefaults = audioTrackCaptureDefaults,
             videoTrackCaptureDefaults = videoTrackCaptureDefaults,
             audioTrackPublishDefaults = audioTrackPublishDefaults,
             videoTrackPublishDefaults = videoTrackPublishDefaults,
-            e2eeOptions = null,
+            screenShareTrackCaptureDefaults = screenShareTrackCaptureDefaults,
+            screenShareTrackPublishDefaults = screenShareTrackPublishDefaults,
         )
 
-    suspend fun connect(url: String, token: String, options: ConnectOptions = ConnectOptions(), roomOptions: RoomOptions = getCurrentRoomOptions()) {
-        if (this::coroutineScope.isInitialized) {
-            coroutineScope.cancel()
+    /**
+     * prepareConnection should be called as soon as the page is loaded, in order
+     * to speed up the connection attempt. This function will
+     * - perform DNS resolution and pre-warm the DNS cache
+     * - establish TLS connection and cache TLS keys
+     *
+     * With LiveKit Cloud, it will also determine the best edge data center for
+     * the current client to connect to if a token is provided.
+     */
+    suspend fun prepareConnection(url: String, token: String? = null) {
+        if (state != State.DISCONNECTED) {
+            LKLog.i { "Room is not in disconnected state, ignoring prepareConnection call." }
+            return
         }
-        coroutineScope = CoroutineScope(defaultDispatcher + SupervisorJob())
+        LKLog.d { "preparing connection to $url" }
 
-        // Setup local participant.
-        localParticipant.reinitialize()
+        try {
+            val urlActual = URI(url)
+            if (urlActual.isLKCloud() && token != null) {
+                val regionUrlProvider = regionUrlProviderFactory.create(urlActual, token)
+                this.regionUrlProvider = regionUrlProvider
+
+                val regionUrl = regionUrlProvider.getNextBestRegionUrl()
+                // we will not replace the regionUrl if an attempt had already started
+                // to avoid overriding regionUrl after a new connection attempt had started
+                if (regionUrl != null && state == State.DISCONNECTED) {
+                    this.regionUrl = regionUrl
+                    connectionWarmer.fetch(regionUrl)
+                    LKLog.d { "prepared connection to $regionUrl" }
+                }
+            } else {
+                connectionWarmer.fetch(url)
+            }
+        } catch (e: Exception) {
+            LKLog.e(e) { "Error while preparing connection:" }
+        }
+    }
+
+    /**
+     * Connect to a LiveKit Room.
+     *
+     * @param url
+     * @param token
+     * @param options
+     *
+     * @throws IllegalStateException when connect is attempted while the room is not disconnected.
+     * @throws Exception when connection fails
+     */
+    @Throws(Exception::class)
+    suspend fun connect(url: String, token: String, options: ConnectOptions = ConnectOptions()) = coroutineScope {
+        if (state != State.DISCONNECTED) {
+            throw IllegalStateException("Room.connect attempted while room is not disconnected!")
+        }
+        val roomOptions: RoomOptions
+        stateLock.withLock {
+            if (state != State.DISCONNECTED) {
+                throw IllegalStateException("Room.connect attempted while room is not disconnected!")
+            }
+            if (::coroutineScope.isInitialized) {
+                val job = coroutineScope.coroutineContext.job
+                coroutineScope.cancel()
+                job.join()
+            }
+
+            state = State.CONNECTING
+            connectOptions = options
+
+            coroutineScope = CoroutineScope(defaultDispatcher + SupervisorJob())
+
+            roomOptions = getCurrentRoomOptions()
+
+            // Setup local participant.
+            localParticipant.reinitialize()
+            setupLocalParticipantEventHandling()
+
+            if (roomOptions.e2eeOptions != null) {
+                e2eeManager = e2EEManagerFactory.create(roomOptions.e2eeOptions.keyProvider).apply {
+                    setup(this@Room) { event ->
+                        coroutineScope.launch {
+                            emitWhenConnected(event)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Use an empty coroutineExceptionHandler since we want to
+        // rethrow all throwables from the connect job.
+        val emptyCoroutineExceptionHandler = CoroutineExceptionHandler { _, _ -> }
+        val connectJob = coroutineScope.launch(
+            ioDispatcher + emptyCoroutineExceptionHandler,
+        ) {
+            if (audioProcessingController is AuthedAudioProcessingController) {
+                audioProcessingController.authenticate(url, token)
+            }
+
+            // Don't use URL equals.
+            if (regionUrlProvider?.serverUrl.toString() != url) {
+                regionUrl = null
+                regionUrlProvider = null
+            }
+
+            val urlObj = URI(url)
+            if (urlObj.isLKCloud()) {
+                if (regionUrlProvider == null) {
+                    regionUrlProvider = regionUrlProviderFactory.create(urlObj, token)
+                } else {
+                    regionUrlProvider?.token = token
+                }
+
+                // trigger the first fetch without waiting for a response
+                // if initial connection fails, this will speed up picking regional url
+                // on subsequent runs
+                launch {
+                    try {
+                        regionUrlProvider?.fetchRegionSettings()
+                    } catch (e: Exception) {
+                        LKLog.w(e) { "could not fetch region settings" }
+                    }
+                }
+            }
+
+            var nextUrl: String? = regionUrl ?: url
+            regionUrl = null
+
+            while (nextUrl != null) {
+                val connectUrl = nextUrl
+                nextUrl = null
+                try {
+                    engine.regionUrlProvider = regionUrlProvider
+                    engine.join(connectUrl, token, options, roomOptions)
+                } catch (e: Exception) {
+                    if (e is CancellationException) {
+                        throw e // rethrow to properly cancel.
+                    }
+
+                    nextUrl = regionUrlProvider?.getNextBestRegionUrl()
+                    if (nextUrl != null) {
+                        LKLog.d(e) { "Connection to $connectUrl failed, retrying with another region: $nextUrl" }
+                    } else {
+                        throw e // rethrow since no more regions to try.
+                    }
+                }
+            }
+
+            ensureActive()
+            networkCallbackManager.registerCallback()
+            if (options.audio) {
+                val audioTrack = localParticipant.createAudioTrack()
+                localParticipant.publishAudioTrack(audioTrack)
+            }
+            ensureActive()
+            if (options.video) {
+                val videoTrack = localParticipant.createVideoTrack()
+                localParticipant.publishVideoTrack(videoTrack)
+            }
+
+            coroutineScope.launch {
+                if (enableMetrics) {
+                    collectMetrics(room = this@Room, rtcEngine = engine)
+                }
+            }
+        }
+
+        val outerHandler = coroutineContext.job.invokeOnCompletion { cause ->
+            // Cancel connect job if invoking coroutine is cancelled.
+            if (cause is CancellationException) {
+                connectJob.cancel(cause)
+            }
+        }
+
+        var error: Throwable? = null
+        connectJob.invokeOnCompletion { cause ->
+            outerHandler.dispose()
+            error = cause
+        }
+        connectJob.join()
+
+        error?.let { throw it }
+    }
+
+    /**
+     * Disconnect from the room.
+     */
+    fun disconnect() {
+        engine.client.sendLeave()
+        handleDisconnect(DisconnectReason.CLIENT_INITIATED)
+    }
+
+    /**
+     * Copies all the options to the Room object.
+     *
+     * Any null values in [options] will not overwrite existing values.
+     * To clear existing values on the Room object, explicitly set the value
+     * directly instead of using this method.
+     */
+    fun setRoomOptions(options: RoomOptions) {
+        options.audioTrackCaptureDefaults?.let {
+            audioTrackCaptureDefaults = it
+        }
+        options.videoTrackCaptureDefaults?.let {
+            videoTrackCaptureDefaults = it
+        }
+
+        options.audioTrackPublishDefaults?.let {
+            audioTrackPublishDefaults = it
+        }
+        options.videoTrackPublishDefaults?.let {
+            videoTrackPublishDefaults = it
+        }
+        options.screenShareTrackCaptureDefaults?.let {
+            screenShareTrackCaptureDefaults = it
+        }
+        options.screenShareTrackPublishDefaults?.let {
+            screenShareTrackPublishDefaults = it
+        }
+        adaptiveStream = options.adaptiveStream
+        dynacast = options.dynacast
+        e2eeOptions = options.e2eeOptions
+    }
+
+    /**
+     * Release all resources held by this object.
+     *
+     * Once called, this room object must not be used to connect to a server and a new one
+     * must be created.
+     */
+    fun release() {
+        closeableManager.close()
+    }
+
+    /**
+     * @suppress
+     */
+    override fun onJoinResponse(response: LivekitRtc.JoinResponse) {
+        LKLog.i { "Connected to server, server version: ${response.serverVersion}, client version: ${Version.CLIENT_VERSION}" }
+
+        if (response.room.sid != null) {
+            sid = Sid(response.room.sid)
+        } else {
+            sid = null
+        }
+        name = response.room.name
+        metadata = response.room.metadata
+
+        if (e2eeManager != null && !response.sifTrailer.isEmpty) {
+            e2eeManager!!.keyProvider().setSifTrailer(response.sifTrailer.toByteArray())
+        }
+
+        if (response.room.activeRecording != isRecording) {
+            isRecording = response.room.activeRecording
+            eventBus.postEvent(RoomEvent.RecordingStatusChanged(this, isRecording), coroutineScope)
+        }
+
+        if (!response.hasParticipant()) {
+            throw RoomException.ConnectException("server didn't return a local participant")
+        }
+
+        localParticipant.updateFromInfo(response.participant)
+        localParticipant.setEnabledPublishCodecs(response.enabledPublishCodecsList)
+
+        if (response.otherParticipantsList.isNotEmpty()) {
+            response.otherParticipantsList.forEach { info ->
+                getOrCreateRemoteParticipant(Participant.Identity(info.identity), info)
+            }
+        }
+    }
+
+    private fun setupLocalParticipantEventHandling() {
         coroutineScope.launch {
             localParticipant.events.collect {
                 when (it) {
                     is ParticipantEvent.TrackPublished -> emitWhenConnected(
                         RoomEvent.TrackPublished(
+                            room = this@Room,
+                            publication = it.publication,
+                            participant = it.participant,
+                        ),
+                    )
+
+                    is ParticipantEvent.TrackUnpublished -> emitWhenConnected(
+                        RoomEvent.TrackUnpublished(
                             room = this@Room,
                             publication = it.publication,
                             participant = it.participant,
@@ -243,12 +624,22 @@ constructor(
                     )
 
                     is ParticipantEvent.MetadataChanged -> {
-                        listener?.onMetadataChanged(it.participant, it.prevMetadata, this@Room)
                         emitWhenConnected(
                             RoomEvent.ParticipantMetadataChanged(
                                 this@Room,
                                 it.participant,
                                 it.prevMetadata,
+                            ),
+                        )
+                    }
+
+                    is ParticipantEvent.AttributesChanged -> {
+                        emitWhenConnected(
+                            RoomEvent.ParticipantAttributesChanged(
+                                this@Room,
+                                it.participant,
+                                it.changedAttributes,
+                                it.oldAttributes,
                             ),
                         )
                     }
@@ -269,123 +660,56 @@ constructor(
                 }
             }
         }
-
-        state = State.CONNECTING
-        connectOptions = options
-
-        if (roomOptions.e2eeOptions != null) {
-            e2eeManager = e2EEManagerFactory.create(roomOptions.e2eeOptions.keyProvider).apply {
-                setup(this@Room) { event ->
-                    coroutineScope.launch {
-                        emitWhenConnected(event)
-                    }
-                }
-            }
-        }
-
-        engine.join(url, token, options, roomOptions)
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val networkRequest = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
-        cm.registerNetworkCallback(networkRequest, networkCallback)
-
-        if (options.audio) {
-            val audioTrack = localParticipant.createAudioTrack()
-            localParticipant.publishAudioTrack(audioTrack)
-        }
-        if (options.video) {
-            val videoTrack = localParticipant.createVideoTrack()
-            localParticipant.publishVideoTrack(videoTrack)
-        }
     }
 
-    /**
-     * Disconnect from the room.
-     */
-    fun disconnect() {
-        engine.client.sendLeave()
-        handleDisconnect(DisconnectReason.CLIENT_INITIATED)
-    }
-
-    /**
-     * Release all resources held by this object.
-     *
-     * Once called, this room object must not be used to connect to a server and a new one
-     * must be created.
-     */
-    fun release() {
-        closeableManager.close()
-    }
-
-    /**
-     * @suppress
-     */
-    override fun onJoinResponse(response: LivekitRtc.JoinResponse) {
-        LKLog.i { "Connected to server, server version: ${response.serverVersion}, client version: ${Version.CLIENT_VERSION}" }
-
-        sid = Sid(response.room.sid)
-        name = response.room.name
-        metadata = response.room.metadata
-
-        if (e2eeManager != null && !response.sifTrailer.isEmpty) {
-            e2eeManager!!.keyProvider().setSifTrailer(response.sifTrailer.toByteArray())
-        }
-
-        if (response.room.activeRecording != isRecording) {
-            isRecording = response.room.activeRecording
-            eventBus.postEvent(RoomEvent.RecordingStatusChanged(this, isRecording), coroutineScope)
-        }
-
-        if (!response.hasParticipant()) {
-            listener?.onFailedToConnect(this, RoomException.ConnectException("server didn't return any participants"))
-            return
-        }
-
-        localParticipant.updateFromInfo(response.participant)
-
-        if (response.otherParticipantsList.isNotEmpty()) {
-            response.otherParticipantsList.forEach {
-                getOrCreateRemoteParticipant(it.sid, it)
-            }
-        }
-    }
-
-    private fun handleParticipantDisconnect(sid: String) {
+    private fun handleParticipantDisconnect(identity: Participant.Identity) {
         val newParticipants = mutableRemoteParticipants.toMutableMap()
-        val removedParticipant = newParticipants.remove(sid) ?: return
-        removedParticipant.tracks.values.toList().forEach { publication ->
+        val removedParticipant = newParticipants.remove(identity) ?: return
+        removedParticipant.trackPublications.values.toList().forEach { publication ->
             removedParticipant.unpublishTrack(publication.sid, true)
         }
 
         mutableRemoteParticipants = newParticipants
-        listener?.onParticipantDisconnected(this, removedParticipant)
         eventBus.postEvent(RoomEvent.ParticipantDisconnected(this, removedParticipant), coroutineScope)
+
+        localParticipant.handleParticipantDisconnect(identity)
     }
 
-    fun getParticipant(sid: String): Participant? {
+    fun getParticipantBySid(sid: String): Participant? {
+        return getParticipantBySid(Participant.Sid(sid))
+    }
+
+    fun getParticipantBySid(sid: Participant.Sid): Participant? {
         if (sid == localParticipant.sid) {
             return localParticipant
         } else {
-            return remoteParticipants[sid]
+            return remoteParticipants[sidToIdentity[sid]]
+        }
+    }
+
+    fun getParticipantByIdentity(identity: String): Participant? {
+        return getParticipantByIdentity(Participant.Identity(identity))
+    }
+
+    fun getParticipantByIdentity(identity: Participant.Identity): Participant? {
+        if (identity == localParticipant.identity) {
+            return localParticipant
+        } else {
+            return remoteParticipants[identity]
         }
     }
 
     @Synchronized
     private fun getOrCreateRemoteParticipant(
-        sid: String,
-        info: LivekitModels.ParticipantInfo? = null,
+        identity: Participant.Identity,
+        info: LivekitModels.ParticipantInfo,
     ): RemoteParticipant {
-        var participant = remoteParticipants[sid]
+        var participant = remoteParticipants[identity]
         if (participant != null) {
             return participant
         }
 
-        participant = if (info != null) {
-            RemoteParticipant(info, engine.client, ioDispatcher, defaultDispatcher)
-        } else {
-            RemoteParticipant(sid, null, engine.client, ioDispatcher, defaultDispatcher)
-        }
+        participant = RemoteParticipant(info, engine.client, ioDispatcher, defaultDispatcher)
         participant.internalListener = this
 
         coroutineScope.launch {
@@ -421,12 +745,22 @@ constructor(
                     )
 
                     is ParticipantEvent.MetadataChanged -> {
-                        listener?.onMetadataChanged(it.participant, it.prevMetadata, this@Room)
                         emitWhenConnected(
                             RoomEvent.ParticipantMetadataChanged(
                                 this@Room,
                                 it.participant,
                                 it.prevMetadata,
+                            ),
+                        )
+                    }
+
+                    is ParticipantEvent.AttributesChanged -> {
+                        emitWhenConnected(
+                            RoomEvent.ParticipantAttributesChanged(
+                                this@Room,
+                                it.participant,
+                                it.changedAttributes,
+                                it.oldAttributes,
                             ),
                         )
                     }
@@ -457,26 +791,25 @@ constructor(
             }
         }
 
-        if (info != null) {
-            participant.updateFromInfo(info)
-        }
+        participant.updateFromInfo(info)
 
         val newRemoteParticipants = mutableRemoteParticipants.toMutableMap()
-        newRemoteParticipants[sid] = participant
+        newRemoteParticipants[identity] = participant
         mutableRemoteParticipants = newRemoteParticipants
+        sidToIdentity[participant.sid] = identity
 
         return participant
     }
 
     private fun handleActiveSpeakersUpdate(speakerInfos: List<LivekitModels.SpeakerInfo>) {
         val speakers = mutableListOf<Participant>()
-        val seenSids = mutableSetOf<String>()
+        val seenSids = mutableSetOf<Participant.Sid>()
         val localParticipant = localParticipant
         speakerInfos.forEach { speakerInfo ->
-            val speakerSid = speakerInfo.sid!!
+            val speakerSid = Participant.Sid(speakerInfo.sid)
             seenSids.add(speakerSid)
 
-            val participant = getParticipant(speakerSid) ?: return@forEach
+            val participant = getParticipantBySid(speakerSid) ?: return@forEach
             participant.audioLevel = speakerInfo.level
             participant.isSpeaking = true
             speakers.add(participant)
@@ -494,26 +827,26 @@ constructor(
             }
 
         mutableActiveSpeakers = speakers.toList()
-        listener?.onActiveSpeakersChanged(mutableActiveSpeakers, this)
         eventBus.postEvent(RoomEvent.ActiveSpeakersChanged(this, mutableActiveSpeakers), coroutineScope)
     }
 
     private fun handleSpeakersChanged(speakerInfos: List<LivekitModels.SpeakerInfo>) {
-        val updatedSpeakers = mutableMapOf<String, Participant>()
-        activeSpeakers.forEach {
-            updatedSpeakers[it.sid] = it
+        val updatedSpeakers = mutableMapOf<Participant.Sid, Participant>()
+        activeSpeakers.forEach { participant ->
+            updatedSpeakers[participant.sid] = participant
         }
 
         speakerInfos.forEach { speaker ->
-            val participant = getParticipant(speaker.sid) ?: return@forEach
+            val speakerSid = Participant.Sid(speaker.sid)
+            val participant = getParticipantBySid(speakerSid) ?: return@forEach
 
             participant.audioLevel = speaker.level
             participant.isSpeaking = speaker.active
 
             if (speaker.active) {
-                updatedSpeakers[speaker.sid] = participant
+                updatedSpeakers[speakerSid] = participant
             } else {
-                updatedSpeakers.remove(speaker.sid)
+                updatedSpeakers.remove(speakerSid)
             }
         }
 
@@ -521,7 +854,6 @@ constructor(
             .sortedBy { it.audioLevel }
 
         mutableActiveSpeakers = updatedSpeakersList.toList()
-        listener?.onActiveSpeakersChanged(mutableActiveSpeakers, this)
         eventBus.postEvent(RoomEvent.ActiveSpeakersChanged(this, mutableActiveSpeakers), coroutineScope)
     }
 
@@ -530,6 +862,30 @@ constructor(
             return
         }
         engine.reconnect()
+    }
+
+    private fun handleDisconnect(reason: DisconnectReason) {
+        if (state == State.DISCONNECTED) {
+            return
+        }
+        runBlocking {
+            stateLock.withLock {
+                if (state == State.DISCONNECTED) {
+                    return@runBlocking
+                }
+                networkCallbackManager.unregisterCallback()
+
+                state = State.DISCONNECTED
+                cleanupRoom()
+                engine.close()
+
+                localParticipant.dispose()
+
+                // Ensure all observers see the disconnected before closing scope.
+                eventBus.postEvent(RoomEvent.Disconnected(this@Room, null, reason), coroutineScope).join()
+                coroutineScope.cancel()
+            }
+        }
     }
 
     /**
@@ -546,33 +902,7 @@ constructor(
         metadata = null
         name = null
         isRecording = false
-    }
-
-    private fun handleDisconnect(reason: DisconnectReason) {
-        if (state == State.DISCONNECTED) {
-            return
-        }
-
-        try {
-            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            cm.unregisterNetworkCallback(networkCallback)
-        } catch (e: IllegalArgumentException) {
-            // do nothing, may happen on older versions if attempting to unregister twice.
-        }
-
-        state = State.DISCONNECTED
-        engine.close()
-        cleanupRoom()
-
-        listener?.onDisconnect(this, null)
-        listener = null
-        localParticipant.dispose()
-
-        // Ensure all observers see the disconnected before closing scope.
-        runBlocking {
-            eventBus.postEvent(RoomEvent.Disconnected(this@Room, null, reason), coroutineScope).join()
-        }
-        coroutineScope.cancel()
+        sidToIdentity.clear()
     }
 
     private fun sendSyncState() {
@@ -581,8 +911,8 @@ constructor(
         val participantTracksList = mutableListOf<LivekitModels.ParticipantTracks>()
         for (participant in remoteParticipants.values) {
             val builder = LivekitModels.ParticipantTracks.newBuilder()
-            builder.participantSid = participant.sid
-            for (trackPub in participant.tracks.values) {
+            builder.participantSid = participant.sid.value
+            for (trackPub in participant.trackPublications.values) {
                 val remoteTrackPub = (trackPub as? RemoteTrackPublication) ?: continue
                 if (remoteTrackPub.subscribed != sendUnsub) {
                     builder.addTrackSids(remoteTrackPub.sid)
@@ -630,6 +960,7 @@ constructor(
             SimulateScenario.NODE_FAILURE -> builder.nodeFailure = true
             SimulateScenario.MIGRATION -> builder.migration = true
             SimulateScenario.SERVER_LEAVE -> builder.serverLeave = true
+            SimulateScenario.SERVER_LEAVE_FULL_RECONNECT -> builder.leaveRequestFullReconnect = true
         }
         sendSimulateScenario(builder.build())
     }
@@ -642,29 +973,49 @@ constructor(
         fun create(context: Context): Room
     }
 
-    // ------------------------------------- NetworkCallback -------------------------------------//
-    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
-        /**
-         * @suppress
-         */
-        override fun onLost(network: Network) {
-            // lost connection, flip to reconnecting
-            hasLostConnectivity = true
-        }
+    // ------------------------------------- General Utility functions -------------------------------------//
 
-        /**
-         * @suppress
-         */
-        override fun onAvailable(network: Network) {
-            // only actually reconnect after connection is re-established
-            if (!hasLostConnectivity) {
-                return
-            }
-            LKLog.i { "network connection available, reconnecting" }
-            reconnect()
-            hasLostConnectivity = false
-        }
+    /**
+     * Control muting/unmuting all audio output.
+     *
+     * Note: using this mute will only mute local audio output, and will still receive the data from
+     * remote audio tracks. Consider turning off [ConnectOptions.autoSubscribe] and manually unsubscribing
+     * if you need more fine-grained control over the data usage.
+     **/
+    fun setSpeakerMute(muted: Boolean) {
+        audioDeviceModule.setSpeakerMute(muted)
     }
+
+    /**
+     * Control muting/unmuting the audio input.
+     *
+     * Note: using this mute will only zero the microphone audio data, and will still send data to
+     * remote participants (although they will not hear anything). Consider using [TrackPublication.muted]
+     * for more fine-grained control over the data usage.
+     */
+    fun setMicrophoneMute(muted: Boolean) {
+        audioDeviceModule.setMicrophoneMute(muted)
+    }
+
+    // ------------------------------------- NetworkCallback -------------------------------------//
+    private val networkCallbackManager = networkCallbackManagerFactory.invoke(
+        object : NetworkCallback() {
+            override fun onLost(network: Network) {
+                // lost connection, flip to reconnecting
+                hasLostConnectivity = true
+            }
+
+            override fun onAvailable(network: Network) {
+                // only actually reconnect after connection is re-established
+                if (!hasLostConnectivity) {
+                    return
+                }
+                LKLog.i { "network connection available, reconnecting" }
+                reconnect()
+                hasLostConnectivity = false
+            }
+        },
+    )
 
     // ----------------------------------- RTCEngine.Listener ------------------------------------//
 
@@ -681,7 +1032,6 @@ constructor(
      */
     override fun onEngineReconnected() {
         state = State.CONNECTED
-        listener?.onReconnected(this)
         eventBus.postEvent(RoomEvent.Reconnected(this), coroutineScope)
     }
 
@@ -690,7 +1040,6 @@ constructor(
      */
     override fun onEngineReconnecting() {
         state = State.RECONNECTING
-        listener?.onReconnecting(this)
         eventBus.postEvent(RoomEvent.Reconnecting(this), coroutineScope)
     }
 
@@ -703,12 +1052,20 @@ constructor(
             return
         }
 
-        var (participantSid, trackSid) = unpackStreamId(streams.first().id)
-        if (trackSid == null) {
-            trackSid = track.id()
+        var (participantSid, streamId) = unpackStreamId(streams.first().id)
+        var trackSid = track.id()
+
+        if (streamId != null && streamId.startsWith("TR")) {
+            trackSid = streamId
         }
-        val participant = getOrCreateRemoteParticipant(participantSid)
-        val statsGetter = createStatsGetter(engine.subscriber.peerConnection, receiver)
+        val participant = getParticipantBySid(participantSid) as? RemoteParticipant
+
+        if (participant == null) {
+            LKLog.e { "Tried to add a track for a participant that is not present. sid: $participantSid" }
+            return
+        }
+
+        val statsGetter = engine.createStatsGetter(receiver)
         participant.addSubscribedMediaTrack(
             track,
             trackSid!!,
@@ -723,24 +1080,36 @@ constructor(
      */
     override fun onUpdateParticipants(updates: List<LivekitModels.ParticipantInfo>) {
         for (info in updates) {
-            val participantSid = info.sid
+            val participantSid = Participant.Sid(info.sid)
+            // LiveKit server doesn't send identity info prior to version 1.5.2 in disconnect updates
+            // so we try to map an empty identity to an already known sID manually
 
-            if (localParticipant.sid == participantSid) {
+            @Suppress("NAME_SHADOWING") var info = info
+            if (info.identity.isNullOrBlank()) {
+                info = with(info.toBuilder()) {
+                    identity = sidToIdentity[participantSid]?.value ?: ""
+                    build()
+                }
+            }
+
+            val participantIdentity = Participant.Identity(info.identity)
+
+            if (localParticipant.identity == participantIdentity) {
                 localParticipant.updateFromInfo(info)
                 continue
             }
 
-            val isNewParticipant = !remoteParticipants.contains(participantSid)
+            val isNewParticipant = !remoteParticipants.contains(participantIdentity)
 
             if (info.state == LivekitModels.ParticipantInfo.State.DISCONNECTED) {
-                handleParticipantDisconnect(participantSid)
+                handleParticipantDisconnect(participantIdentity)
             } else {
-                val participant = getOrCreateRemoteParticipant(participantSid, info)
+                val participant = getOrCreateRemoteParticipant(participantIdentity, info)
                 if (isNewParticipant) {
-                    listener?.onParticipantConnected(this, participant)
                     eventBus.postEvent(RoomEvent.ParticipantConnected(this, participant), coroutineScope)
                 } else {
                     participant.updateFromInfo(info)
+                    sidToIdentity[participantSid] = participantIdentity
                 }
             }
         }
@@ -764,6 +1133,9 @@ constructor(
      * @suppress
      */
     override fun onRoomUpdate(update: LivekitModels.Room) {
+        if (update.sid != null) {
+            sid = Sid(update.sid)
+        }
         val oldMetadata = metadata
         metadata = update.metadata
 
@@ -785,9 +1157,8 @@ constructor(
     override fun onConnectionQuality(updates: List<LivekitRtc.ConnectionQualityInfo>) {
         updates.forEach { info ->
             val quality = ConnectionQuality.fromProto(info.quality)
-            val participant = getParticipant(info.participantSid) ?: return
+            val participant = getParticipantBySid(info.participantSid) ?: return
             participant.connectionQuality = quality
-            listener?.onConnectionQualityChanged(participant, quality)
             eventBus.postEvent(RoomEvent.ConnectionQualityChanged(this, participant, quality), coroutineScope)
         }
     }
@@ -803,7 +1174,7 @@ constructor(
      * @suppress
      */
     override fun onUserPacket(packet: LivekitModels.UserPacket, kind: LivekitModels.DataPacket.Kind) {
-        val participant = remoteParticipants[packet.participantSid]
+        val participant = getParticipantBySid(packet.participantSid) as? RemoteParticipant
         val data = packet.payload.toByteArray()
         val topic = if (packet.hasTopic()) {
             packet.topic
@@ -811,7 +1182,6 @@ constructor(
             null
         }
 
-        listener?.onDataReceived(data, participant, this)
         eventBus.postEvent(RoomEvent.DataReceived(this, data, participant, topic), coroutineScope)
         participant?.onDataReceived(data, topic)
     }
@@ -819,10 +1189,48 @@ constructor(
     /**
      * @suppress
      */
+    override fun onTranscriptionReceived(transcription: LivekitModels.Transcription) {
+        if (transcription.segmentsList.isEmpty()) {
+            LKLog.d { "Received transcription segments are empty." }
+            return
+        }
+
+        val participant = getParticipantByIdentity(transcription.transcribedParticipantIdentity)
+        val publication = participant?.trackPublications?.get(transcription.trackId)
+        val segments = transcription.segmentsList
+            .map { it.toSDKType(firstReceivedTime = transcriptionReceivedTimes[it.id] ?: Date().time) }
+
+        // Update receive times
+        for (segment in segments) {
+            if (segment.final) {
+                transcriptionReceivedTimes.remove(segment.id)
+            } else {
+                transcriptionReceivedTimes[segment.id] = segment.firstReceivedTime
+            }
+        }
+
+        val event = RoomEvent.TranscriptionReceived(
+            room = this,
+            transcriptionSegments = segments,
+            participant = participant,
+            publication = publication,
+        )
+        eventBus.tryPostEvent(event)
+        participant?.onTranscriptionReceived(event)
+        publication?.onTranscriptionReceived(event)
+    }
+
+    override fun onRpcPacketReceived(dp: LivekitModels.DataPacket) {
+        localParticipant.handleDataPacket(dp)
+    }
+
+    /**
+     * @suppress
+     */
     override fun onStreamStateUpdate(streamStates: List<LivekitRtc.StreamStateInfo>) {
         for (streamState in streamStates) {
-            val participant = getParticipant(streamState.participantSid) ?: continue
-            val track = participant.tracks[streamState.trackSid] ?: continue
+            val participant = getParticipantBySid(streamState.participantSid) ?: continue
+            val track = participant.trackPublications[streamState.trackSid] ?: continue
 
             track.track?.streamState = Track.StreamState.fromProto(streamState.state)
         }
@@ -839,7 +1247,7 @@ constructor(
      * @suppress
      */
     override fun onSubscriptionPermissionUpdate(subscriptionPermissionUpdate: LivekitRtc.SubscriptionPermissionUpdate) {
-        val participant = getParticipant(subscriptionPermissionUpdate.participantSid) as? RemoteParticipant ?: return
+        val participant = getParticipantBySid(subscriptionPermissionUpdate.participantSid) as? RemoteParticipant ?: return
         participant.onSubscriptionPermissionUpdate(subscriptionPermissionUpdate)
     }
 
@@ -855,7 +1263,6 @@ constructor(
      * @suppress
      */
     override fun onFailToConnect(error: Throwable) {
-        listener?.onFailedToConnect(this, error)
         // scope will likely be closed already here, so force it out of scope.
         eventBus.tryPostEvent(RoomEvent.FailedToConnect(this, error))
     }
@@ -864,7 +1271,7 @@ constructor(
      * @suppress
      */
     override fun onSignalConnected(isResume: Boolean) {
-        if (state == State.RECONNECTING && isResume) {
+        if (isResume) {
             // during resume reconnection, need to send sync state upon signal connection.
             sendSyncState()
         }
@@ -876,7 +1283,7 @@ constructor(
     override fun onFullReconnecting() {
         localParticipant.prepareForFullReconnect()
         remoteParticipants.keys.toMutableSet() // copy keys to avoid concurrent modifications.
-            .forEach { sid -> handleParticipantDisconnect(sid) }
+            .forEach { identity -> handleParticipantDisconnect(identity) }
     }
 
     /**
@@ -888,7 +1295,7 @@ constructor(
         } else {
             val remoteParticipants = remoteParticipants.values.toList()
             for (participant in remoteParticipants) {
-                val pubs = participant.tracks.values.toList()
+                val pubs = participant.trackPublications.values.toList()
                 for (pub in pubs) {
                     val remotePub = pub as? RemoteTrackPublication ?: continue
                     if (remotePub.subscribed) {
@@ -897,6 +1304,23 @@ constructor(
                 }
             }
         }
+    }
+
+    /**
+     * @suppress
+     */
+    override fun onLocalTrackSubscribed(response: LivekitRtc.TrackSubscribed) {
+        val publication = localParticipant.trackPublications[response.trackSid] as? LocalTrackPublication
+
+        if (publication == null) {
+            LKLog.w { "Could not find local track publication for subscribed event " }
+            return
+        }
+
+        coroutineScope.launch {
+            emitWhenConnected(RoomEvent.LocalTrackSubscribed(this@Room, publication, this@Room.localParticipant))
+        }
+        this.localParticipant.onLocalTrackSubscribed(publication)
     }
 
     /**
@@ -916,13 +1340,11 @@ constructor(
 
     /** @suppress */
     override fun onTrackMuted(publication: TrackPublication, participant: Participant) {
-        listener?.onTrackMuted(publication, participant, this)
         eventBus.postEvent(RoomEvent.TrackMuted(this, publication, participant), coroutineScope)
     }
 
     /** @suppress */
     override fun onTrackUnmuted(publication: TrackPublication, participant: Participant) {
-        listener?.onTrackUnmuted(publication, participant, this)
         eventBus.postEvent(RoomEvent.TrackUnmuted(this, publication, participant), coroutineScope)
     }
 
@@ -930,7 +1352,6 @@ constructor(
      * @suppress
      */
     override fun onTrackUnpublished(publication: RemoteTrackPublication, participant: RemoteParticipant) {
-        listener?.onTrackUnpublished(publication, participant, this)
         eventBus.postEvent(RoomEvent.TrackUnpublished(this, publication, participant), coroutineScope)
     }
 
@@ -938,7 +1359,6 @@ constructor(
      * @suppress
      */
     override fun onTrackPublished(publication: LocalTrackPublication, participant: LocalParticipant) {
-        listener?.onTrackPublished(publication, participant, this)
         if (e2eeManager != null) {
             e2eeManager!!.addPublishedTrack(publication.track!!, publication, participant, this)
         }
@@ -949,7 +1369,6 @@ constructor(
      * @suppress
      */
     override fun onTrackUnpublished(publication: LocalTrackPublication, participant: LocalParticipant) {
-        listener?.onTrackUnpublished(publication, participant, this)
         e2eeManager?.let { e2eeManager ->
             e2eeManager!!.removePublishedTrack(publication.track!!, publication, participant, this)
         }
@@ -960,7 +1379,6 @@ constructor(
      * @suppress
      */
     override fun onTrackSubscribed(track: Track, publication: RemoteTrackPublication, participant: RemoteParticipant) {
-        listener?.onTrackSubscribed(track, publication, participant, this)
         if (e2eeManager != null) {
             e2eeManager!!.addSubscribedTrack(track, publication, participant, this)
         }
@@ -975,7 +1393,6 @@ constructor(
         exception: Exception,
         participant: RemoteParticipant,
     ) {
-        listener?.onTrackSubscriptionFailed(sid, exception, participant, this)
         eventBus.postEvent(RoomEvent.TrackSubscriptionFailed(this, sid, exception, participant), coroutineScope)
     }
 
@@ -987,7 +1404,6 @@ constructor(
         publication: RemoteTrackPublication,
         participant: RemoteParticipant,
     ) {
-        listener?.onTrackUnsubscribed(track, publication, participant, this)
         e2eeManager?.let { e2eeManager ->
             e2eeManager!!.removeSubscribedTrack(track, publication, participant, this)
         }
@@ -995,8 +1411,9 @@ constructor(
     }
 
     /**
-     * // TODO(@dl): can this be moved out of Room/SDK?
+     * Initialize a [SurfaceViewRenderer] for rendering a video from this room.
      */
+    // TODO(@dl): can this be moved out of Room/SDK?
     fun initVideoRenderer(viewRenderer: SurfaceViewRenderer) {
         viewRenderer.init(eglBase.eglBaseContext, null)
         viewRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
@@ -1004,8 +1421,9 @@ constructor(
     }
 
     /**
-     * // TODO(@dl): can this be moved out of Room/SDK?
+     * Initialize a [TextureViewRenderer] for rendering a video from this room.
      */
+    // TODO(@dl): can this be moved out of Room/SDK?
     fun initVideoRenderer(viewRenderer: TextureViewRenderer) {
         viewRenderer.init(eglBase.eglBaseContext, null)
         viewRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
@@ -1042,138 +1460,6 @@ constructor(
     @VisibleForTesting
     fun setReconnectionType(reconnectType: ReconnectType) {
         engine.reconnectType = reconnectType
-    }
-}
-
-/**
- * Room Listener, this class provides callbacks that clients should override.
- *
- */
-@Deprecated("Use Room.events instead")
-interface RoomListener {
-    /**
-     * A network change has been detected and LiveKit attempts to reconnect to the room
-     * When reconnect attempts succeed, the room state will be kept, including tracks that are subscribed/published
-     */
-    fun onReconnecting(room: Room) {}
-
-    /**
-     * The reconnect attempt had been successful
-     */
-    fun onReconnected(room: Room) {}
-
-    /**
-     * Disconnected from room
-     */
-    fun onDisconnect(room: Room, error: Exception?) {}
-
-    /**
-     * When a [RemoteParticipant] joins after the local participant. It will not emit events
-     * for participants that are already in the room
-     */
-    fun onParticipantConnected(room: Room, participant: RemoteParticipant) {}
-
-    /**
-     * When a [RemoteParticipant] leaves after the local participant has joined.
-     */
-    fun onParticipantDisconnected(room: Room, participant: RemoteParticipant) {}
-
-    /**
-     * Could not connect to the room
-     */
-    fun onFailedToConnect(room: Room, error: Throwable) {}
-//        fun onReconnecting(room: Room, error: Exception) {}
-//        fun onReconnect(room: Room) {}
-
-    /**
-     * Active speakers changed. List of speakers are ordered by their audio level. loudest
-     * speakers first. This will include the [LocalParticipant] too.
-     */
-    fun onActiveSpeakersChanged(speakers: List<Participant>, room: Room) {}
-
-    // Participant callbacks
-    /**
-     * Participant metadata is a simple way for app-specific state to be pushed to all users.
-     * When RoomService.UpdateParticipantMetadata is called to change a participant's state,
-     * this event will be fired for all clients in the room.
-     */
-    fun onMetadataChanged(participant: Participant, prevMetadata: String?, room: Room) {}
-
-    /**
-     * The participant was muted.
-     *
-     * For the local participant, the callback will be called if setMute was called on the
-     * [LocalTrackPublication], or if the server has requested the participant to be muted
-     */
-    fun onTrackMuted(publication: TrackPublication, participant: Participant, room: Room) {}
-
-    /**
-     * The participant was unmuted.
-     *
-     * For the local participant, the callback will be called if setMute was called on the
-     * [LocalTrackPublication], or if the server has requested the participant to be muted
-     */
-    fun onTrackUnmuted(publication: TrackPublication, participant: Participant, room: Room) {}
-
-    /**
-     * When a new track is published to room after the local participant has joined. It will
-     * not fire for tracks that are already published
-     */
-    fun onTrackPublished(publication: RemoteTrackPublication, participant: RemoteParticipant, room: Room) {}
-
-    /**
-     * A [RemoteParticipant] has unpublished a track
-     */
-    fun onTrackUnpublished(publication: RemoteTrackPublication, participant: RemoteParticipant, room: Room) {}
-
-    /**
-     * When a new track is published to room after the local participant has joined.
-     */
-    fun onTrackPublished(publication: LocalTrackPublication, participant: LocalParticipant, room: Room) {}
-
-    /**
-     * [LocalParticipant] has unpublished a track
-     */
-    fun onTrackUnpublished(publication: LocalTrackPublication, participant: LocalParticipant, room: Room) {}
-
-    /**
-     * The [LocalParticipant] has subscribed to a new track. This event will always fire as
-     * long as new tracks are ready for use.
-     */
-    fun onTrackSubscribed(track: Track, publication: TrackPublication, participant: RemoteParticipant, room: Room) {}
-
-    /**
-     * Could not subscribe to a track
-     */
-    fun onTrackSubscriptionFailed(sid: String, exception: Exception, participant: RemoteParticipant, room: Room) {}
-
-    /**
-     * A subscribed track is no longer available. Clients should listen to this event and ensure
-     * the track removes all renderers
-     */
-    fun onTrackUnsubscribed(track: Track, publications: TrackPublication, participant: RemoteParticipant, room: Room) {}
-
-    /**
-     * Received data published by another participant
-     */
-    fun onDataReceived(data: ByteArray, participant: RemoteParticipant?, room: Room) {}
-
-    /**
-     * The connection quality for a participant has changed.
-     *
-     * @param participant Either a remote participant or [Room.localParticipant]
-     * @param quality the new connection quality
-     */
-    fun onConnectionQualityChanged(participant: Participant, quality: ConnectionQuality) {}
-
-    companion object {
-        fun getDefaultDevice(kind: DeviceManager.Kind): String? {
-            return DeviceManager.getDefaultDevice(kind)
-        }
-
-        fun setDefaultDevice(kind: DeviceManager.Kind, deviceId: String?) {
-            DeviceManager.setDefaultDevice(kind, deviceId)
-        }
     }
 }
 

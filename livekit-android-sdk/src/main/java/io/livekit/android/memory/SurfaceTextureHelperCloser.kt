@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,16 @@
 
 package io.livekit.android.memory
 
-import org.webrtc.SurfaceTextureHelper
+import livekit.org.webrtc.SurfaceTextureHelper
 import java.io.Closeable
 
-internal class SurfaceTextureHelperCloser(private val surfaceTextureHelper: SurfaceTextureHelper) : Closeable {
+internal class SurfaceTextureHelperCloser(private val surfaceTextureHelper: SurfaceTextureHelper?) : Closeable {
     private var isClosed = false
     override fun close() {
         if (!isClosed) {
             isClosed = true
-            surfaceTextureHelper.stopListening()
-            surfaceTextureHelper.dispose()
+            surfaceTextureHelper?.stopListening()
+            surfaceTextureHelper?.dispose()
         }
     }
 }

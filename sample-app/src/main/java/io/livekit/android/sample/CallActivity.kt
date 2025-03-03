@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,19 +31,29 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import com.xwray.groupie.GroupieAdapter
 import io.livekit.android.sample.common.R
 import io.livekit.android.sample.databinding.CallActivityBinding
+import io.livekit.android.sample.dialog.showAudioProcessorSwitchDialog
 import io.livekit.android.sample.dialog.showDebugMenuDialog
 import io.livekit.android.sample.dialog.showSelectAudioDeviceDialog
+import io.livekit.android.sample.model.StressTest
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.parcelize.Parcelize
 
 class CallActivity : AppCompatActivity() {
 
-    val viewModel: CallViewModel by viewModelByFactory {
+    private val viewModel: CallViewModel by viewModelByFactory {
         val args = intent.getParcelableExtra<BundleArgs>(KEY_ARGS)
             ?: throw NullPointerException("args is null!")
-        CallViewModel(args.url, args.token, application, args.e2ee, args.e2eeKey)
+
+        CallViewModel(
+            url = args.url,
+            token = args.token,
+            e2ee = args.e2eeOn,
+            e2eeKey = args.e2eeKey,
+            stressTest = args.stressTest,
+            application = application,
+        )
     }
-    lateinit var binding: CallActivityBinding
+    private lateinit var binding: CallActivityBinding
     private val screenCaptureIntentLauncher =
         registerForActivityResult(
             ActivityResultContracts.StartActivityForResult(),
@@ -56,6 +66,7 @@ class CallActivity : AppCompatActivity() {
             viewModel.startScreenCapture(data)
         }
 
+    @androidx.camera.camera2.interop.ExperimentalCamera2Interop
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -146,6 +157,18 @@ class CallActivity : AppCompatActivity() {
                 .show()
         }
 
+        viewModel.enhancedNsEnabled.observe(this) { enabled ->
+            binding.enhancedNs.visibility = if (enabled) {
+                android.view.View.VISIBLE
+            } else {
+                android.view.View.GONE
+            }
+        }
+
+        binding.enhancedNs.setOnClickListener {
+            showAudioProcessorSwitchDialog(viewModel)
+        }
+
         binding.exit.setOnClickListener { finish() }
 
         // Controls row 2
@@ -202,5 +225,11 @@ class CallActivity : AppCompatActivity() {
     }
 
     @Parcelize
-    data class BundleArgs(val url: String, val token: String, val e2ee: Boolean, val e2eeKey: String) : Parcelable
+    data class BundleArgs(
+        val url: String,
+        val token: String,
+        val e2eeKey: String,
+        val e2eeOn: Boolean,
+        val stressTest: StressTest,
+    ) : Parcelable
 }

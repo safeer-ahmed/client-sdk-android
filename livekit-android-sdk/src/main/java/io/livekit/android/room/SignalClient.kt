@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2025 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 package io.livekit.android.room
 
+import androidx.annotation.VisibleForTesting
 import com.vdurmont.semver4j.Semver
 import io.livekit.android.ConnectOptions
 import io.livekit.android.RoomOptions
@@ -27,23 +28,37 @@ import io.livekit.android.stats.getClientInfo
 import io.livekit.android.util.CloseableCoroutineScope
 import io.livekit.android.util.Either
 import io.livekit.android.util.LKLog
+import io.livekit.android.util.toHttpUrl
+import io.livekit.android.util.toWebsocketUrl
 import io.livekit.android.webrtc.toProtoSessionDescription
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import livekit.LivekitModels
+import livekit.LivekitModels.AudioTrackFeature
 import livekit.LivekitRtc
 import livekit.LivekitRtc.JoinResponse
 import livekit.LivekitRtc.ReconnectResponse
-import okhttp3.*
+import livekit.org.webrtc.IceCandidate
+import livekit.org.webrtc.PeerConnection
+import livekit.org.webrtc.SessionDescription
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
-import org.webrtc.IceCandidate
-import org.webrtc.PeerConnection
-import org.webrtc.SessionDescription
-import java.util.*
+import java.util.Date
 import javax.inject.Inject
 import javax.inject.Named
 import javax.inject.Singleton
@@ -69,7 +84,7 @@ constructor(
     private var currentWs: WebSocket? = null
     private var isReconnecting: Boolean = false
     var listener: Listener? = null
-    private var serverVersion: Semver? = null
+    internal var serverVersion: Semver? = null
     private var lastUrl: String? = null
     private var lastOptions: ConnectOptions? = null
     private var lastRoomOptions: RoomOptions? = null
@@ -84,11 +99,19 @@ constructor(
         >? = null
     private lateinit var coroutineScope: CloseableCoroutineScope
 
+    /**
+     * @see [startRequestQueue]
+     */
+    private val requestFlow = MutableSharedFlow<LivekitRtc.SignalRequest>(Int.MAX_VALUE)
     private val requestFlowJobLock = Object()
     private var requestFlowJob: Job? = null
-    private val requestFlow = MutableSharedFlow<LivekitRtc.SignalRequest>(Int.MAX_VALUE)
 
-    private val responseFlow = MutableSharedFlow<LivekitRtc.SignalResponse>(Int.MAX_VALUE)
+    /**
+     * @see [onReadyForResponses]
+     */
+    private val responseFlow = MutableSharedFlow<Pair<WebSocket, LivekitRtc.SignalResponse>>(Int.MAX_VALUE)
+    private val responseFlowJobLock = Object()
+    private var responseFlowJob: Job? = null
 
     private var pingJob: Job? = null
     private var pongJob: Job? = null
@@ -101,6 +124,7 @@ constructor(
     /**
      * @throws Exception if fails to connect.
      */
+    @Throws(Exception::class)
     suspend fun join(
         url: String,
         token: String,
@@ -114,6 +138,8 @@ constructor(
     /**
      * @throws Exception if fails to connect.
      */
+    @Throws(Exception::class)
+    @VisibleForTesting
     suspend fun reconnect(url: String, token: String, participantSid: String?): Either<ReconnectResponse, Unit> {
         val reconnectResponse = connect(
             url,
@@ -135,9 +161,9 @@ constructor(
         roomOptions: RoomOptions,
     ): Either<JoinResponse, Either<ReconnectResponse, Unit>> {
         // Clean up any pre-existing connection.
-        close(reason = "Starting new connection")
+        close(reason = "Starting new connection", shouldClearQueuedRequests = false)
 
-        val wsUrlString = "$url/rtc" + createConnectionParams(token, getClientInfo(), options, roomOptions)
+        val wsUrlString = "${url.toWebsocketUrl()}/rtc" + createConnectionParams(token, getClientInfo(), options, roomOptions)
         isReconnecting = options.reconnect
 
         LKLog.i { "connecting to $wsUrlString" }
@@ -202,10 +228,17 @@ constructor(
      * Should be called after resolving the join message.
      */
     fun onReadyForResponses() {
-        coroutineScope.launch {
-            responseFlow.collect {
-                responseFlow.resetReplayCache()
-                handleSignalResponseImpl(it)
+        if (responseFlowJob != null) {
+            return
+        }
+        synchronized(responseFlowJobLock) {
+            if (responseFlowJob == null) {
+                responseFlowJob = coroutineScope.launch {
+                    responseFlow.collect { (ws, response) ->
+                        responseFlow.resetReplayCache()
+                        handleSignalResponseImpl(ws, response)
+                    }
+                }
             }
         }
     }
@@ -237,19 +270,31 @@ constructor(
 
     // --------------------------------- WebSocket Listener --------------------------------------//
     override fun onMessage(webSocket: WebSocket, text: String) {
+        if (webSocket != currentWs) {
+            // Possibly message from old websocket, discard.
+            return
+        }
+
         LKLog.w { "received JSON message, unsupported in this version." }
     }
 
     override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+        if (webSocket != currentWs) {
+            // Possibly message from old websocket, discard.
+            return
+        }
         val byteArray = bytes.toByteArray()
         val signalResponseBuilder = LivekitRtc.SignalResponse.newBuilder()
             .mergeFrom(byteArray)
         val response = signalResponseBuilder.build()
 
-        handleSignalResponse(response)
+        handleSignalResponse(webSocket, response)
     }
 
     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+        if (webSocket != currentWs) {
+            return
+        }
         handleWebSocketClose(reason, code)
     }
 
@@ -258,10 +303,13 @@ constructor(
     }
 
     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+        if (webSocket != currentWs) {
+            return
+        }
         var reason: String? = null
         try {
             lastUrl?.let {
-                val validationUrl = "http" + it.substring(2).replaceFirst("/rtc?", "/rtc/validate?")
+                val validationUrl = it.toHttpUrl().replaceFirst("/rtc?", "/rtc/validate?")
                 val request = Request.Builder().url(validationUrl).build()
                 val resp = okHttpClient.newCall(request).execute()
                 val body = resp.body
@@ -314,6 +362,7 @@ constructor(
             SD_TYPE_ANSWER -> SessionDescription.Type.ANSWER
             SD_TYPE_OFFER -> SessionDescription.Type.OFFER
             SD_TYPE_PRANSWER -> SessionDescription.Type.PRANSWER
+            SD_TYPE_ROLLBACK -> SessionDescription.Type.ROLLBACK
             else -> throw IllegalArgumentException("invalid RTC SdpType: ${sd.type}")
         }
         return SessionDescription(rtcSdpType, sd.sdp)
@@ -376,14 +425,21 @@ constructor(
         cid: String,
         name: String,
         type: LivekitModels.TrackType,
+        stream: String?,
         builder: LivekitRtc.AddTrackRequest.Builder = LivekitRtc.AddTrackRequest.newBuilder(),
     ) {
-        var encryptionType = lastRoomOptions?.e2eeOptions?.encryptionType ?: LivekitModels.Encryption.Type.NONE
-        val addTrackRequest = builder
-            .setCid(cid)
-            .setName(name)
-            .setType(type)
-            .setEncryption(encryptionType)
+        val encryptionType = lastRoomOptions?.e2eeOptions?.encryptionType ?: LivekitModels.Encryption.Type.NONE
+        val addTrackRequest = builder.apply {
+            setCid(cid)
+            setName(name)
+            setType(type)
+            if (stream != null) {
+                setStream(stream)
+            } else {
+                clearStream()
+            }
+            encryption = encryptionType
+        }
         val request = LivekitRtc.SignalRequest.newBuilder()
             .setAddTrack(addTrackRequest)
             .build()
@@ -456,10 +512,11 @@ constructor(
         sendRequest(request)
     }
 
-    fun sendUpdateLocalMetadata(metadata: String?, name: String?) {
+    fun sendUpdateLocalMetadata(metadata: String?, name: String?, attributes: Map<String, String>? = emptyMap()) {
         val update = LivekitRtc.UpdateParticipantMetadata.newBuilder()
             .setMetadata(metadata ?: "")
             .setName(name ?: "")
+            .putAllAttributes(attributes)
 
         val request = LivekitRtc.SignalRequest.newBuilder()
             .setUpdateMetadata(update)
@@ -485,9 +542,16 @@ constructor(
     }
 
     fun sendLeave() {
-        val request = LivekitRtc.SignalRequest.newBuilder()
-            .setLeave(LivekitRtc.LeaveRequest.newBuilder().build())
-            .build()
+        val request = with(LivekitRtc.SignalRequest.newBuilder()) {
+            leave = with(LivekitRtc.LeaveRequest.newBuilder()) {
+                reason = LivekitModels.DisconnectReason.CLIENT_INITIATED
+                // server doesn't process this field, keeping it here to indicate the intent of a full disconnect
+                action = LivekitRtc.LeaveRequest.Action.DISCONNECT
+                build()
+            }
+            build()
+        }
+
         sendRequest(request)
     }
 
@@ -511,6 +575,19 @@ constructor(
         )
 
         return time
+    }
+
+    fun sendUpdateLocalAudioTrack(trackSid: String, features: Collection<AudioTrackFeature>) {
+        val request = with(LivekitRtc.SignalRequest.newBuilder()) {
+            updateAudioTrack = with(LivekitRtc.UpdateLocalAudioTrack.newBuilder()) {
+                setTrackSid(trackSid)
+                addAllFeatures(features)
+                build()
+            }
+            build()
+        }
+
+        sendRequest(request)
     }
 
     private fun sendRequest(request: LivekitRtc.SignalRequest) {
@@ -537,7 +614,11 @@ constructor(
         }
     }
 
-    private fun handleSignalResponse(response: LivekitRtc.SignalResponse) {
+    private fun handleSignalResponse(ws: WebSocket, response: LivekitRtc.SignalResponse) {
+        if (ws != currentWs) {
+            return
+        }
+
         LKLog.v { "response: $response" }
 
         if (!isConnected) {
@@ -558,7 +639,7 @@ constructor(
                 joinContinuation?.resumeWith(Result.success(Either.Left(response.join)))
             } else if (response.hasLeave()) {
                 // Some reconnects may immediately send leave back without a join response first.
-                handleSignalResponseImpl(response)
+                handleSignalResponseImpl(ws, response)
             } else if (isReconnecting) {
                 // When reconnecting, any message received means signal reconnected.
                 // Newer servers will send a reconnect response first
@@ -582,10 +663,15 @@ constructor(
                 return
             }
         }
-        responseFlow.tryEmit(response)
+        responseFlow.tryEmit(ws to response)
     }
 
-    private fun handleSignalResponseImpl(response: LivekitRtc.SignalResponse) {
+    private fun handleSignalResponseImpl(ws: WebSocket, response: LivekitRtc.SignalResponse) {
+        if (ws != currentWs) {
+            LKLog.v { "received message from old websocket, discarding." }
+            return
+        }
+
         when (response.messageCase) {
             LivekitRtc.SignalResponse.MessageCase.ANSWER -> {
                 val sd = fromProtoSessionDescription(response.answer)
@@ -610,6 +696,10 @@ constructor(
 
             LivekitRtc.SignalResponse.MessageCase.UPDATE -> {
                 listener?.onParticipantUpdate(response.update.participantsList)
+            }
+
+            LivekitRtc.SignalResponse.MessageCase.TRACK_SUBSCRIBED -> {
+                listener?.onLocalTrackSubscribed(response.trackSubscribed)
             }
 
             LivekitRtc.SignalResponse.MessageCase.TRACK_PUBLISHED -> {
@@ -681,6 +771,10 @@ constructor(
                 // TODO
             }
 
+            LivekitRtc.SignalResponse.MessageCase.REQUEST_RESPONSE -> {
+                // TODO
+            }
+
             LivekitRtc.SignalResponse.MessageCase.MESSAGE_NOT_SET,
             null,
             -> {
@@ -722,7 +816,7 @@ constructor(
      *
      * Can be reused afterwards.
      */
-    fun close(code: Int = CLOSE_REASON_NORMAL_CLOSURE, reason: String = "Normal Closure") {
+    fun close(code: Int = CLOSE_REASON_NORMAL_CLOSURE, reason: String = "Normal Closure", shouldClearQueuedRequests: Boolean = true) {
         LKLog.v(Exception()) { "Closing SignalClient: code = $code, reason = $reason" }
         isConnected = false
         isReconnecting = false
@@ -731,6 +825,8 @@ constructor(
         }
         requestFlowJob?.cancel()
         requestFlowJob = null
+        responseFlowJob?.cancel()
+        responseFlowJob = null
         pingJob?.cancel()
         pingJob = null
         pongJob?.cancel()
@@ -739,12 +835,14 @@ constructor(
         currentWs = null
         joinContinuation?.cancel()
         joinContinuation = null
-        // TODO: support calling this from connect without wiping any queued requests.
-        // requestFlow.resetReplayCache()
+        if (shouldClearQueuedRequests) {
+            requestFlow.resetReplayCache()
+        }
         responseFlow.resetReplayCache()
         lastUrl = null
         lastOptions = null
         lastRoomOptions = null
+        serverVersion = null
     }
 
     interface Listener {
@@ -765,6 +863,7 @@ constructor(
         fun onSubscriptionPermissionUpdate(subscriptionPermissionUpdate: LivekitRtc.SubscriptionPermissionUpdate)
         fun onRefreshToken(token: String)
         fun onLocalTrackUnpublished(trackUnpublished: LivekitRtc.TrackUnpublishedResponse)
+        fun onLocalTrackSubscribed(trackSubscribed: LivekitRtc.TrackSubscribed)
     }
 
     companion object {
@@ -784,6 +883,7 @@ constructor(
         const val SD_TYPE_ANSWER = "answer"
         const val SD_TYPE_OFFER = "offer"
         const val SD_TYPE_PRANSWER = "pranswer"
+        const val SD_TYPE_ROLLBACK = "rollback"
         const val SDK_TYPE = "android"
 
         private val skipQueueTypes = listOf(
@@ -823,4 +923,10 @@ enum class ProtocolVersion(val value: Int) {
     v7(7),
     v8(8),
     v9(9),
+    v10(10),
+    v11(11),
+    v12(12),
+
+    // new leave request handling
+    v13(13),
 }

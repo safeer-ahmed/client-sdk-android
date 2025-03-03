@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2025 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 package io.livekit.android.events
 
+import io.livekit.android.annotations.Beta
 import io.livekit.android.e2ee.E2EEState
 import io.livekit.android.room.Room
 import io.livekit.android.room.participant.ConnectionQuality
@@ -27,6 +28,7 @@ import io.livekit.android.room.track.LocalTrackPublication
 import io.livekit.android.room.track.RemoteTrackPublication
 import io.livekit.android.room.track.Track
 import io.livekit.android.room.track.TrackPublication
+import io.livekit.android.room.types.TranscriptionSegment
 import livekit.LivekitModels
 
 sealed class RoomEvent(val room: Room) : Event() {
@@ -87,6 +89,22 @@ sealed class RoomEvent(val room: Room) : Event() {
         val prevMetadata: String?,
     ) : RoomEvent(room)
 
+    /**
+     * When a participant's attributes are changed, fired for all participants
+     */
+    class ParticipantAttributesChanged(
+        room: Room,
+        val participant: Participant,
+        /**
+         * The attributes that have changed and their new associated values.
+         */
+        val changedAttributes: Map<String, String>,
+        /**
+         * The old attributes prior to change.
+         */
+        val oldAttributes: Map<String, String>,
+    ) : RoomEvent(room)
+
     class ParticipantNameChanged(
         room: Room,
         val participant: Participant,
@@ -108,6 +126,11 @@ sealed class RoomEvent(val room: Room) : Event() {
      * [LocalTrackPublication], or if the server has requested the participant to be muted
      */
     class TrackUnmuted(room: Room, val publication: TrackPublication, val participant: Participant) : RoomEvent(room)
+
+    /**
+     * Fired when the first remote participant has subscribed to the localParticipant's track
+     */
+    class LocalTrackSubscribed(room: Room, val publication: LocalTrackPublication, val participant: LocalParticipant) : RoomEvent(room)
 
     /**
      * When a new track is published to room after the local participant has joined. It will
@@ -219,6 +242,23 @@ sealed class RoomEvent(val room: Room) : Event() {
         val participant: Participant,
         var state: E2EEState,
     ) : RoomEvent(room)
+
+    @Beta
+    class TranscriptionReceived(
+        room: Room,
+        /**
+         * The transcription segments.
+         */
+        val transcriptionSegments: List<TranscriptionSegment>,
+        /**
+         * The applicable participant these transcriptions apply to.
+         */
+        val participant: Participant?,
+        /**
+         * The applicable track publication these transcriptions apply to.
+         */
+        val publication: TrackPublication?,
+    ) : RoomEvent(room)
 }
 
 enum class DisconnectReason {
@@ -230,8 +270,17 @@ enum class DisconnectReason {
     ROOM_DELETED,
     STATE_MISMATCH,
     JOIN_FAILURE,
+    MIGRATION,
+    SIGNAL_CLOSE,
+    ROOM_CLOSED,
+    USER_UNAVAILABLE,
+    USER_REJECTED,
+    SIP_TRUNK_FAILURE,
 }
 
+/**
+ * @suppress
+ */
 fun LivekitModels.DisconnectReason?.convert(): DisconnectReason {
     return when (this) {
         LivekitModels.DisconnectReason.CLIENT_INITIATED -> DisconnectReason.CLIENT_INITIATED
@@ -241,6 +290,12 @@ fun LivekitModels.DisconnectReason?.convert(): DisconnectReason {
         LivekitModels.DisconnectReason.ROOM_DELETED -> DisconnectReason.ROOM_DELETED
         LivekitModels.DisconnectReason.STATE_MISMATCH -> DisconnectReason.STATE_MISMATCH
         LivekitModels.DisconnectReason.JOIN_FAILURE -> DisconnectReason.JOIN_FAILURE
+        LivekitModels.DisconnectReason.MIGRATION -> DisconnectReason.MIGRATION
+        LivekitModels.DisconnectReason.SIGNAL_CLOSE -> DisconnectReason.SIGNAL_CLOSE
+        LivekitModels.DisconnectReason.ROOM_CLOSED -> DisconnectReason.ROOM_CLOSED
+        LivekitModels.DisconnectReason.USER_UNAVAILABLE -> DisconnectReason.USER_UNAVAILABLE
+        LivekitModels.DisconnectReason.USER_REJECTED -> DisconnectReason.USER_REJECTED
+        LivekitModels.DisconnectReason.SIP_TRUNK_FAILURE -> DisconnectReason.SIP_TRUNK_FAILURE
         LivekitModels.DisconnectReason.UNKNOWN_REASON,
         LivekitModels.DisconnectReason.UNRECOGNIZED,
         null,

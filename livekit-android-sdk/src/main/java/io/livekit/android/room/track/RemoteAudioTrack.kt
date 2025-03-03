@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,32 +16,42 @@
 
 package io.livekit.android.room.track
 
-import org.webrtc.AudioTrack
-import org.webrtc.AudioTrackSink
-import org.webrtc.RtpReceiver
+import livekit.org.webrtc.AudioTrack
+import livekit.org.webrtc.AudioTrackSink
+import livekit.org.webrtc.RtpReceiver
 
+/**
+ * A representation of a remote audio track.
+ */
 class RemoteAudioTrack(
     name: String,
     rtcTrack: AudioTrack,
-    internal val receiver: RtpReceiver
+    internal val receiver: RtpReceiver,
 ) : io.livekit.android.room.track.AudioTrack(name, rtcTrack) {
 
-    /**
-     * Adds a sink that receives the audio bytes and related information
-     * for this audio track. Repeated calls using the same sink will
-     * only add the sink once.
-     *
-     * Implementations should copy the audio data into a local copy if they wish
-     * to use the data after this function returns.
-     */
-    fun addSink(sink: AudioTrackSink) {
-        rtcTrack.addSink(sink)
+    override fun addSink(sink: AudioTrackSink) {
+        withRTCTrack {
+            rtcTrack.addSink(sink)
+        }
+    }
+
+    override fun removeSink(sink: AudioTrackSink) {
+        withRTCTrack {
+            rtcTrack.removeSink(sink)
+        }
     }
 
     /**
-     * Removes a previously added sink.
+     * Sets the volume.
+     *
+     * @param volume a gain value in the range 0 to 10.
+     * * 0 will mute the track
+     * * 1 will play the track normally
+     * * values greater than 1 will boost the volume of the track.
      */
-    fun removeSink(sink: AudioTrackSink) {
-        rtcTrack.removeSink(sink)
+    fun setVolume(volume: Double) {
+        withRTCTrack {
+            rtcTrack.setVolume(volume)
+        }
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ package io.livekit.android.room.participant
 
 import io.livekit.android.events.ParticipantEvent
 import io.livekit.android.room.SignalClient
+import io.livekit.android.room.track.KIND_AUDIO
+import io.livekit.android.room.track.KIND_VIDEO
 import io.livekit.android.room.track.RemoteAudioTrack
 import io.livekit.android.room.track.RemoteTrackPublication
 import io.livekit.android.room.track.RemoteVideoTrack
@@ -32,15 +34,18 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import livekit.LivekitModels
 import livekit.LivekitRtc
-import org.webrtc.AudioTrack
-import org.webrtc.MediaStreamTrack
-import org.webrtc.RtpReceiver
-import org.webrtc.VideoTrack
+import livekit.org.webrtc.AudioTrack
+import livekit.org.webrtc.MediaStreamTrack
+import livekit.org.webrtc.RtpReceiver
+import livekit.org.webrtc.VideoTrack
 
+/**
+ * A representation of a remote participant.
+ */
 class RemoteParticipant(
-    sid: String,
-    identity: String? = null,
-    val signalClient: SignalClient,
+    sid: Sid,
+    identity: Identity? = null,
+    internal val signalClient: SignalClient,
     private val ioDispatcher: CoroutineDispatcher,
     defaultDispatcher: CoroutineDispatcher,
 ) : Participant(sid, identity, defaultDispatcher) {
@@ -57,8 +62,8 @@ class RemoteParticipant(
         ioDispatcher: CoroutineDispatcher,
         defaultDispatcher: CoroutineDispatcher,
     ) : this(
-        info.sid,
-        info.identity,
+        Sid(info.sid),
+        Identity(info.identity),
         signalClient,
         ioDispatcher,
         defaultDispatcher,
@@ -68,7 +73,10 @@ class RemoteParticipant(
 
     private val coroutineScope = CloseableCoroutineScope(defaultDispatcher + SupervisorJob())
 
-    fun getTrackPublication(sid: String): RemoteTrackPublication? = tracks[sid] as? RemoteTrackPublication
+    /**
+     * Get a track publication with the corresponding sid.
+     */
+    fun getTrackPublication(sid: String): RemoteTrackPublication? = trackPublications[sid] as? RemoteTrackPublication
 
     /**
      * @suppress
@@ -101,13 +109,12 @@ class RemoteParticipant(
 
         for (publication in newTrackPublications.values) {
             internalListener?.onTrackPublished(publication, this)
-            listener?.onTrackPublished(publication, this)
             eventBus.postEvent(ParticipantEvent.TrackPublished(this, publication), scope)
         }
 
-        val invalidKeys = tracks.keys - validTrackPublication.keys
+        val invalidKeys = trackPublications.keys - validTrackPublication.keys
         for (invalidKey in invalidKeys) {
-            val publication = tracks[invalidKey] ?: continue
+            val publication = trackPublications[invalidKey] ?: continue
             unpublishTrack(publication.sid, true)
         }
     }
@@ -133,7 +140,6 @@ class RemoteParticipant(
                 LKLog.e { "remote participant ${this.sid} --- $message" }
 
                 internalListener?.onTrackSubscriptionFailed(sid, exception, this)
-                listener?.onTrackSubscriptionFailed(sid, exception, this)
                 eventBus.postEvent(ParticipantEvent.TrackSubscriptionFailed(this, sid, exception), scope)
             } else {
                 coroutineScope.launch {
@@ -170,35 +176,32 @@ class RemoteParticipant(
         // TODO: how does mediatrack send ended event?
 
         internalListener?.onTrackSubscribed(track, publication, this)
-        listener?.onTrackSubscribed(track, publication, this)
         eventBus.postEvent(ParticipantEvent.TrackSubscribed(this, track, publication), scope)
     }
 
     fun unpublishTrack(trackSid: String, sendUnpublish: Boolean = false) {
-        val publication = tracks[trackSid] as? RemoteTrackPublication ?: return
-        tracks = tracks.toMutableMap().apply { remove(trackSid) }
+        val publication = trackPublications[trackSid] as? RemoteTrackPublication ?: return
+        trackPublications = trackPublications.toMutableMap().apply { remove(trackSid) }
 
         val track = publication.track
         if (track != null) {
             try {
                 track.stop()
-            } catch (e: IllegalStateException) {
+            } catch (e: Exception) {
                 // track may already be disposed, ignore.
             }
             internalListener?.onTrackUnsubscribed(track, publication, this)
-            listener?.onTrackUnsubscribed(track, publication, this)
             eventBus.postEvent(ParticipantEvent.TrackUnsubscribed(this, track, publication), scope)
         }
         if (sendUnpublish) {
             internalListener?.onTrackUnpublished(publication, this)
-            listener?.onTrackUnpublished(publication, this)
             eventBus.postEvent(ParticipantEvent.TrackUnpublished(this, publication), scope)
         }
         publication.track = null
     }
 
     internal fun onSubscriptionPermissionUpdate(subscriptionPermissionUpdate: LivekitRtc.SubscriptionPermissionUpdate) {
-        val pub = tracks[subscriptionPermissionUpdate.trackSid] as? RemoteTrackPublication ?: return
+        val pub = trackPublications[subscriptionPermissionUpdate.trackSid] as? RemoteTrackPublication ?: return
 
         if (pub.subscriptionAllowed != subscriptionPermissionUpdate.allowed) {
             pub.subscriptionAllowed = subscriptionPermissionUpdate.allowed
@@ -212,12 +215,6 @@ class RemoteParticipant(
 
     // Internal methods just for posting events.
     internal fun onDataReceived(data: ByteArray, topic: String?) {
-        listener?.onDataReceived(data, this)
         eventBus.postEvent(ParticipantEvent.DataReceived(this, data, topic), scope)
-    }
-
-    companion object {
-        private const val KIND_AUDIO = "audio"
-        private const val KIND_VIDEO = "video"
     }
 }

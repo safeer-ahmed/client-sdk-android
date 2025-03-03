@@ -22,7 +22,13 @@
 
 # WebRTC
 #########################################
--keep class org.webrtc.** { *; }
+-keep class livekit.org.webrtc.** { *; }
+
+# NIST sdp parser
+#########################################
+-keep class android.gov.nist.** { *; }
+-dontwarn com.sun.nio.sctp.**
+-dontwarn org.apache.log4j.**
 
 # Protobuf
 #########################################

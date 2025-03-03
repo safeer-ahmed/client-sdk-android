@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 package io.livekit.android.e2ee
 
 import io.livekit.android.util.LKLog
-import org.webrtc.FrameCryptorFactory
-import org.webrtc.FrameCryptorKeyProvider
+import livekit.org.webrtc.FrameCryptorFactory
+import livekit.org.webrtc.FrameCryptorKeyProvider
 
 class KeyInfo
 constructor(var participantId: String, var keyIndex: Int, var key: String) {
@@ -43,13 +43,14 @@ public interface KeyProvider {
 
 class BaseKeyProvider
 constructor(
-    private var ratchetSalt: String,
-    private var uncryptedMagicBytes: String,
-    private var ratchetWindowSize: Int,
+    private var ratchetSalt: String = defaultRatchetSalt,
+    private var uncryptedMagicBytes: String = defaultMagicBytes,
+    private var ratchetWindowSize: Int = defaultRatchetWindowSize,
     override var enableSharedKey: Boolean = true,
-    private var failureTolerance: Int,
-) :
-    KeyProvider {
+    private var failureTolerance: Int = defaultFailureTolerance,
+    private var keyRingSize: Int = defaultKeyRingSize,
+    private var discardFrameWhenCryptorNotReady: Boolean = defaultDiscardFrameWhenCryptorNotReady,
+) : KeyProvider {
     private var keys: MutableMap<String, MutableMap<Int, String>> = mutableMapOf()
     override fun setSharedKey(key: String, keyIndex: Int?): Boolean {
         return rtcKeyProvider.setSharedKey(keyIndex ?: 0, key.toByteArray())
@@ -109,6 +110,8 @@ constructor(
             ratchetWindowSize,
             uncryptedMagicBytes.toByteArray(),
             failureTolerance,
+            keyRingSize,
+            discardFrameWhenCryptorNotReady,
         )
     }
 }

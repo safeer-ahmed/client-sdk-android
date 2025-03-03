@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,34 +16,45 @@
 
 package io.livekit.android.room.track
 
-import org.webrtc.VideoSink
-import org.webrtc.VideoTrack
+import io.livekit.android.webrtc.peerconnection.executeBlockingOnRTCThread
+import livekit.org.webrtc.VideoSink
+import livekit.org.webrtc.VideoTrack
 
 abstract class VideoTrack(name: String, override val rtcTrack: VideoTrack) :
     Track(name, Kind.VIDEO, rtcTrack) {
     protected val sinks: MutableList<VideoSink> = ArrayList()
 
-    var enabled: Boolean
-        get() = rtcTrack.enabled()
-        set(value) {
-            rtcTrack.setEnabled(value)
-        }
-
+    /**
+     * Add a [VideoSink] that will receive frames.
+     */
     open fun addRenderer(renderer: VideoSink) {
-        sinks.add(renderer)
-        rtcTrack.addSink(renderer)
+        withRTCTrack {
+            sinks.add(renderer)
+            rtcTrack.addSink(renderer)
+        }
     }
 
+    /**
+     * Remove a previously added [VideoSink].
+     */
     open fun removeRenderer(renderer: VideoSink) {
-        rtcTrack.removeSink(renderer)
-        sinks.remove(renderer)
+        executeBlockingOnRTCThread {
+            if (!isDisposed) {
+                rtcTrack.removeSink(renderer)
+            }
+            sinks.remove(renderer)
+        }
     }
 
     override fun stop() {
-        for (sink in sinks) {
-            rtcTrack.removeSink(sink)
+        executeBlockingOnRTCThread {
+            if (!isDisposed) {
+                for (sink in sinks) {
+                    rtcTrack.removeSink(sink)
+                }
+            }
+            sinks.clear()
         }
-        sinks.clear()
         super.stop()
     }
 }

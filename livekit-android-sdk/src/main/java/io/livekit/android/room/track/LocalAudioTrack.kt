@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,42 +20,161 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
-import org.webrtc.MediaConstraints
-import org.webrtc.PeerConnectionFactory
-import org.webrtc.RtpSender
-import org.webrtc.RtpTransceiver
-import java.util.*
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedFactory
+import dagger.assisted.AssistedInject
+import io.livekit.android.audio.AudioBufferCallback
+import io.livekit.android.audio.AudioBufferCallbackDispatcher
+import io.livekit.android.audio.AudioProcessingController
+import io.livekit.android.audio.AudioRecordSamplesDispatcher
+import io.livekit.android.audio.MixerAudioBufferCallback
+import io.livekit.android.dagger.InjectionNames
+import io.livekit.android.room.participant.LocalParticipant
+import io.livekit.android.util.FlowObservable
+import io.livekit.android.util.LKLog
+import io.livekit.android.util.flow
+import io.livekit.android.util.flowDelegate
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import livekit.LivekitModels.AudioTrackFeature
+import livekit.org.webrtc.AudioTrackSink
+import livekit.org.webrtc.MediaConstraints
+import livekit.org.webrtc.PeerConnectionFactory
+import livekit.org.webrtc.RtpSender
+import livekit.org.webrtc.RtpTransceiver
+import livekit.org.webrtc.audio.AudioDeviceModule
+import livekit.org.webrtc.audio.JavaAudioDeviceModule
+import java.util.UUID
+import javax.inject.Named
 
 /**
  * Represents a local audio track (generally using the microphone as input).
  *
- * This class should not be constructed directly, but rather through [LocalParticipant]
+ * This class should not be constructed directly, but rather through [LocalParticipant.createAudioTrack].
  */
-class LocalAudioTrack(
-    name: String,
-    mediaTrack: org.webrtc.AudioTrack
+class LocalAudioTrack
+@AssistedInject
+constructor(
+    @Assisted name: String,
+    @Assisted mediaTrack: livekit.org.webrtc.AudioTrack,
+    @Assisted private val options: LocalAudioTrackOptions,
+    private val audioProcessingController: AudioProcessingController,
+    @Named(InjectionNames.DISPATCHER_DEFAULT)
+    private val dispatcher: CoroutineDispatcher,
+    @Named(InjectionNames.LOCAL_AUDIO_RECORD_SAMPLES_DISPATCHER)
+    private val audioRecordSamplesDispatcher: AudioRecordSamplesDispatcher,
+    @Named(InjectionNames.LOCAL_AUDIO_BUFFER_CALLBACK_DISPATCHER)
+    private val audioBufferCallbackDispatcher: AudioBufferCallbackDispatcher,
 ) : AudioTrack(name, mediaTrack) {
-    var enabled: Boolean
-        get() = rtcTrack.enabled()
-        set(value) {
-            rtcTrack.setEnabled(value)
-        }
+    /**
+     * To only be used for flow delegate scoping, and should not be cancelled.
+     **/
+    private val delegateScope = CoroutineScope(dispatcher + SupervisorJob())
 
     internal var transceiver: RtpTransceiver? = null
     internal val sender: RtpSender?
         get() = transceiver?.sender
+
+    private val trackSinks = mutableSetOf<AudioTrackSink>()
+
+    /**
+     * Note: This function relies on us setting
+     * [JavaAudioDeviceModule.Builder.setSamplesReadyCallback].
+     * If you provide your own [AudioDeviceModule], or set your own
+     * callback, your sink will not receive any audio data.
+     *
+     * @see AudioTrack.addSink
+     */
+    override fun addSink(sink: AudioTrackSink) {
+        synchronized(trackSinks) {
+            trackSinks.add(sink)
+            audioRecordSamplesDispatcher.registerSink(sink)
+        }
+    }
+
+    override fun removeSink(sink: AudioTrackSink) {
+        synchronized(trackSinks) {
+            trackSinks.remove(sink)
+            audioRecordSamplesDispatcher.unregisterSink(sink)
+        }
+    }
+
+    /**
+     * Use this method to mix in custom audio.
+     *
+     * See [MixerAudioBufferCallback] for automatic handling of mixing in
+     * the provided audio data.
+     */
+    fun setAudioBufferCallback(callback: AudioBufferCallback?) {
+        audioBufferCallbackDispatcher.bufferCallback = callback
+    }
+
+    /**
+     * Changes can be observed by using [io.livekit.android.util.flow]
+     */
+    @FlowObservable
+    @get:FlowObservable
+    val features by flowDelegate(
+        stateFlow = combine(
+            audioProcessingController::capturePostProcessor.flow,
+            audioProcessingController::bypassCapturePostProcessing.flow,
+        ) { processor, bypass ->
+            processor to bypass
+        }
+            .map {
+                val features = getConstantFeatures()
+                val (processor, bypass) = it
+                if (!bypass && processor?.getName() == "krisp_noise_cancellation") {
+                    features.add(AudioTrackFeature.TF_ENHANCED_NOISE_CANCELLATION)
+                }
+                return@map features
+            }
+            .stateIn(delegateScope, SharingStarted.Eagerly, emptySet()),
+    )
+
+    private fun getConstantFeatures(): MutableSet<AudioTrackFeature> {
+        val features = mutableSetOf<AudioTrackFeature>()
+
+        if (options.echoCancellation) {
+            features.add(AudioTrackFeature.TF_ECHO_CANCELLATION)
+        }
+        if (options.noiseSuppression) {
+            features.add(AudioTrackFeature.TF_NOISE_SUPPRESSION)
+        }
+        if (options.autoGainControl) {
+            features.add(AudioTrackFeature.TF_AUTO_GAIN_CONTROL)
+        }
+        // TODO: Handle getting other info from JavaAudioDeviceModule
+        return features
+    }
+
+    override fun dispose() {
+        synchronized(trackSinks) {
+            for (sink in trackSinks) {
+                trackSinks.remove(sink)
+                audioRecordSamplesDispatcher.unregisterSink(sink)
+            }
+        }
+        super.dispose()
+    }
 
     companion object {
         internal fun createTrack(
             context: Context,
             factory: PeerConnectionFactory,
             options: LocalAudioTrackOptions = LocalAudioTrackOptions(),
-            name: String = ""
+            audioTrackFactory: Factory,
+            name: String = "",
         ): LocalAudioTrack {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
                 PackageManager.PERMISSION_GRANTED
             ) {
-                throw SecurityException("Record audio permissions are required to create an audio track.")
+                LKLog.w { "Record audio permissions not granted, microphone recording will not be used." }
             }
 
             val audioConstraints = MediaConstraints()
@@ -72,7 +191,16 @@ class LocalAudioTrack(
             val rtcAudioTrack =
                 factory.createAudioTrack(UUID.randomUUID().toString(), audioSource)
 
-            return LocalAudioTrack(name = name, mediaTrack = rtcAudioTrack)
+            return audioTrackFactory.create(name = name, mediaTrack = rtcAudioTrack, options = options)
         }
+    }
+
+    @AssistedFactory
+    interface Factory {
+        fun create(
+            name: String,
+            mediaTrack: livekit.org.webrtc.AudioTrack,
+            options: LocalAudioTrackOptions,
+        ): LocalAudioTrack
     }
 }

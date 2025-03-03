@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,28 +31,31 @@ import io.livekit.android.room.track.video.CameraCapturerUtils.createCameraEnume
 import io.livekit.android.room.track.video.CameraCapturerUtils.findCamera
 import io.livekit.android.room.track.video.CameraCapturerUtils.getCameraPosition
 import io.livekit.android.room.track.video.CameraCapturerWithSize
+import io.livekit.android.room.track.video.CaptureDispatchObserver
+import io.livekit.android.room.track.video.ScaleCropVideoProcessor
 import io.livekit.android.room.track.video.VideoCapturerWithSize
 import io.livekit.android.room.util.EncodingUtils
 import io.livekit.android.util.FlowObservable
 import io.livekit.android.util.LKLog
 import io.livekit.android.util.flowDelegate
 import livekit.LivekitModels
-import livekit.LivekitModels.VideoQuality
 import livekit.LivekitRtc
 import livekit.LivekitRtc.SubscribedCodec
-import org.webrtc.CameraVideoCapturer
-import org.webrtc.CameraVideoCapturer.CameraEventsHandler
-import org.webrtc.EglBase
-import org.webrtc.MediaStreamTrack
-import org.webrtc.PeerConnectionFactory
-import org.webrtc.RtpParameters
-import org.webrtc.RtpSender
-import org.webrtc.RtpTransceiver
-import org.webrtc.SurfaceTextureHelper
-import org.webrtc.VideoCapturer
-import org.webrtc.VideoProcessor
-import org.webrtc.VideoSource
+import livekit.org.webrtc.CameraVideoCapturer
+import livekit.org.webrtc.CameraVideoCapturer.CameraEventsHandler
+import livekit.org.webrtc.EglBase
+import livekit.org.webrtc.MediaStreamTrack
+import livekit.org.webrtc.PeerConnectionFactory
+import livekit.org.webrtc.RtpParameters
+import livekit.org.webrtc.RtpSender
+import livekit.org.webrtc.RtpTransceiver
+import livekit.org.webrtc.SurfaceTextureHelper
+import livekit.org.webrtc.VideoCapturer
+import livekit.org.webrtc.VideoProcessor
+import livekit.org.webrtc.VideoSink
+import livekit.org.webrtc.VideoSource
 import java.util.UUID
+import livekit.LivekitModels.VideoQuality as ProtoVideoQuality
 
 /**
  * A representation of a local video track (generally input coming from camera or screen).
@@ -62,19 +65,27 @@ import java.util.UUID
 open class LocalVideoTrack
 @AssistedInject
 constructor(
-    @Assisted private var capturer: VideoCapturer,
+    @Assisted capturer: VideoCapturer,
     @Assisted private var source: VideoSource,
     @Assisted name: String,
     @Assisted options: LocalVideoTrackOptions,
-    @Assisted rtcTrack: org.webrtc.VideoTrack,
+    @Assisted rtcTrack: livekit.org.webrtc.VideoTrack,
     private val peerConnectionFactory: PeerConnectionFactory,
     private val context: Context,
     private val eglBase: EglBase,
     private val defaultsManager: DefaultsManager,
     private val trackFactory: Factory,
+    /**
+     * If this is assigned, you must ensure that this observer is associated with the [capturer],
+     * as this will be used to receive frames in [addRenderer].
+     **/
+    @Assisted private var dispatchObserver: CaptureDispatchObserver? = null,
 ) : VideoTrack(name, rtcTrack) {
 
-    override var rtcTrack: org.webrtc.VideoTrack = rtcTrack
+    var capturer = capturer
+        private set
+
+    override var rtcTrack: livekit.org.webrtc.VideoTrack = rtcTrack
         internal set
 
     internal var codec: String? = null
@@ -103,6 +114,9 @@ constructor(
 
     private val closeableManager = CloseableManager()
 
+    /**
+     * Starts the [capturer] with the capture params contained in [options].
+     */
     open fun startCapture() {
         capturer.startCapture(
             options.captureParams.width,
@@ -111,6 +125,9 @@ constructor(
         )
     }
 
+    /**
+     * Stops the [capturer].
+     */
     open fun stopCapture() {
         capturer.stopCapture()
     }
@@ -126,6 +143,26 @@ constructor(
         closeableManager.close()
     }
 
+    override fun addRenderer(renderer: VideoSink) {
+        if (dispatchObserver != null) {
+            dispatchObserver?.registerSink(renderer)
+        } else {
+            super.addRenderer(renderer)
+        }
+    }
+
+    override fun removeRenderer(renderer: VideoSink) {
+        if (dispatchObserver != null) {
+            dispatchObserver?.unregisterSink(renderer)
+        } else {
+            super.removeRenderer(renderer)
+        }
+    }
+
+    /**
+     * If this is a camera track, switches to the new camera determined by [deviceId]
+     */
+    @Deprecated("Use LocalVideoTrack.switchCamera instead.", ReplaceWith("switchCamera(deviceId = deviceId)"))
     fun setDeviceId(deviceId: String) {
         restartTrack(options.copy(deviceId = deviceId))
     }
@@ -218,6 +255,11 @@ constructor(
      * Restart a track with new options.
      */
     fun restartTrack(options: LocalVideoTrackOptions = defaultsManager.videoTrackCaptureDefaults.copy()) {
+        if (isDisposed) {
+            LKLog.e { "Attempting to restart track that was already disposed, aborting." }
+            return
+        }
+
         val oldCapturer = capturer
         val oldSource = source
         val oldRtcTrack = rtcTrack
@@ -226,14 +268,20 @@ constructor(
         oldCapturer.dispose()
         oldSource.dispose()
 
-        // sender owns rtcTrack, so it'll take care of disposing it.
         oldRtcTrack.setEnabled(false)
+
+        // We always own our copy of rtcTrack, so we need to dispose it.
+        // Note: For the first rtcTrack we pass to the PeerConnection, PeerConnection actually
+        // passes it down to the native, and then ends up holding onto a separate copy at the
+        // Java layer. This means our initial rtcTrack isn't owned by PeerConnection, and is
+        // our responsibility to dispose.
+        oldRtcTrack.dispose()
 
         // Close resources associated to the old track. new track resources is registered in createTrack.
         val oldCloseable = closeableManager.unregisterResource(oldRtcTrack)
         oldCloseable?.close()
 
-        val newTrack = createTrack(
+        val newTrack = createCameraTrack(
             peerConnectionFactory,
             context,
             name,
@@ -253,7 +301,7 @@ constructor(
         rtcTrack = newTrack.rtcTrack
         this.options = options
         startCapture()
-        sender?.setTrack(newTrack.rtcTrack, true)
+        sender?.setTrack(newTrack.rtcTrack, false)
     }
 
     internal fun setPublishingLayers(
@@ -268,53 +316,62 @@ constructor(
         sender: RtpSender,
         qualities: List<LivekitRtc.SubscribedQuality>,
     ) {
-        val parameters = sender.parameters ?: return
-        val encodings = parameters.encodings ?: return
-        var hasChanged = false
-
-        if (encodings.firstOrNull()?.scalabilityMode != null) {
-            val encoding = encodings.first()
-            var maxQuality = VideoQuality.OFF
-            for (quality in qualities) {
-                if (quality.enabled && (maxQuality == VideoQuality.OFF || quality.quality.number > maxQuality.number)) {
-                    maxQuality = quality.quality
-                }
-            }
-
-            if (maxQuality == VideoQuality.OFF) {
-                if (encoding.active) {
-                    LKLog.v { "setting svc track to disabled" }
-                    encoding.active = false
-                    hasChanged = true
-                }
-            } else if (!encoding.active) {
-                LKLog.v { "setting svc track to enabled" }
-                encoding.active = true
-                hasChanged = true
-            }
-        } else {
-            // simulcast dynacast encodings
-            for (quality in qualities) {
-                val rid = EncodingUtils.ridForVideoQuality(quality.quality) ?: continue
-                val encoding = encodings.firstOrNull { it.rid == rid }
-                    // use low quality layer settings for non-simulcasted streams
-                    ?: encodings.takeIf { it.size == 1 && quality.quality == LivekitModels.VideoQuality.LOW }?.first()
-                    ?: continue
-                if (encoding.active != quality.enabled) {
-                    hasChanged = true
-                    encoding.active = quality.enabled
-                    LKLog.v { "setting layer ${quality.quality} to ${quality.enabled}" }
-                }
-            }
+        if (isDisposed) {
+            LKLog.i { "attempted to set publishing layer for disposed video track." }
+            return
         }
+        try {
+            val parameters = sender.parameters ?: return
+            val encodings = parameters.encodings ?: return
+            var hasChanged = false
 
-        if (hasChanged) {
-            // This refeshes the native code with the new information
-            sender.parameters = sender.parameters
+            if (encodings.firstOrNull()?.scalabilityMode != null) {
+                val encoding = encodings.first()
+                var maxQuality = ProtoVideoQuality.OFF
+                for (quality in qualities) {
+                    if (quality.enabled && (maxQuality == ProtoVideoQuality.OFF || quality.quality.number > maxQuality.number)) {
+                        maxQuality = quality.quality
+                    }
+                }
+
+                if (maxQuality == ProtoVideoQuality.OFF) {
+                    if (encoding.active) {
+                        LKLog.v { "setting svc track to disabled" }
+                        encoding.active = false
+                        hasChanged = true
+                    }
+                } else if (!encoding.active) {
+                    LKLog.v { "setting svc track to enabled" }
+                    encoding.active = true
+                    hasChanged = true
+                }
+            } else {
+                // simulcast dynacast encodings
+                for (quality in qualities) {
+                    val rid = EncodingUtils.ridForVideoQuality(quality.quality) ?: continue
+                    val encoding = encodings.firstOrNull { it.rid == rid }
+                        // use low quality layer settings for non-simulcasted streams
+                        ?: encodings.takeIf { it.size == 1 && quality.quality == LivekitModels.VideoQuality.LOW }?.first()
+                        ?: continue
+                    if (encoding.active != quality.enabled) {
+                        hasChanged = true
+                        encoding.active = quality.enabled
+                        LKLog.v { "setting layer ${quality.quality} to ${quality.enabled}" }
+                    }
+                }
+            }
+
+            if (hasChanged) {
+                // This refreshes the native code with the new information
+                sender.parameters = parameters
+            }
+        } catch (e: Exception) {
+            LKLog.w(e) { "Exception caught while setting publishing layers." }
+            return
         }
     }
 
-    fun setPublishingCodecs(codecs: List<SubscribedCodec>): List<VideoCodec> {
+    internal fun setPublishingCodecs(codecs: List<SubscribedCodec>): List<VideoCodec> {
         LKLog.v { "setting publishing codecs: $codecs" }
 
         // only enable simulcast codec for preferred codec set
@@ -379,48 +436,14 @@ constructor(
             source: VideoSource,
             name: String,
             options: LocalVideoTrackOptions,
-            rtcTrack: org.webrtc.VideoTrack,
+            rtcTrack: livekit.org.webrtc.VideoTrack,
+            dispatchObserver: CaptureDispatchObserver?,
         ): LocalVideoTrack
     }
 
     companion object {
 
-        internal fun createTrack(
-            peerConnectionFactory: PeerConnectionFactory,
-            context: Context,
-            name: String,
-            capturer: VideoCapturer,
-            options: LocalVideoTrackOptions = LocalVideoTrackOptions(),
-            rootEglBase: EglBase,
-            trackFactory: Factory,
-            videoProcessor: VideoProcessor? = null,
-        ): LocalVideoTrack {
-            val source = peerConnectionFactory.createVideoSource(false)
-            source.setVideoProcessor(videoProcessor)
-            val surfaceTextureHelper = SurfaceTextureHelper.create("VideoCaptureThread", rootEglBase.eglBaseContext)
-            capturer.initialize(
-                surfaceTextureHelper,
-                context,
-                source.capturerObserver,
-            )
-            val rtcTrack = peerConnectionFactory.createVideoTrack(UUID.randomUUID().toString(), source)
-
-            val track = trackFactory.create(
-                capturer = capturer,
-                source = source,
-                options = options,
-                name = name,
-                rtcTrack = rtcTrack,
-            )
-
-            track.closeableManager.registerResource(
-                rtcTrack,
-                SurfaceTextureHelperCloser(surfaceTextureHelper),
-            )
-            return track
-        }
-
-        internal fun createTrack(
+        internal fun createCameraTrack(
             peerConnectionFactory: PeerConnectionFactory,
             context: Context,
             name: String,
@@ -435,30 +458,75 @@ constructor(
                 throw SecurityException("Camera permissions are required to create a camera video track.")
             }
 
-            val source = peerConnectionFactory.createVideoSource(options.isScreencast)
-            source.setVideoProcessor(videoProcessor)
             val (capturer, newOptions) = CameraCapturerUtils.createCameraCapturer(context, options) ?: TODO()
+
+            return createTrack(
+                peerConnectionFactory = peerConnectionFactory,
+                context = context,
+                name = name,
+                capturer = capturer,
+                options = newOptions,
+                rootEglBase = rootEglBase,
+                trackFactory = trackFactory,
+                videoProcessor = videoProcessor,
+            )
+        }
+
+        internal fun createTrack(
+            peerConnectionFactory: PeerConnectionFactory,
+            context: Context,
+            name: String,
+            capturer: VideoCapturer,
+            options: LocalVideoTrackOptions = LocalVideoTrackOptions(),
+            rootEglBase: EglBase,
+            trackFactory: Factory,
+            videoProcessor: VideoProcessor? = null,
+        ): LocalVideoTrack {
+            val source = peerConnectionFactory.createVideoSource(options.isScreencast)
+
+            val finalVideoProcessor = if (options.captureParams.adaptOutputToDimensions) {
+                ScaleCropVideoProcessor(
+                    targetWidth = options.captureParams.width,
+                    targetHeight = options.captureParams.height,
+                ).apply {
+                    childVideoProcessor = videoProcessor
+                }
+            } else {
+                videoProcessor
+            }
+            source.setVideoProcessor(finalVideoProcessor)
+
             val surfaceTextureHelper = SurfaceTextureHelper.create("VideoCaptureThread", rootEglBase.eglBaseContext)
+
+            // Dispatch raw frames to local renderer only if not using a user-provided VideoProcessor.
+            val dispatchObserver = if (videoProcessor == null) {
+                CaptureDispatchObserver().apply {
+                    registerObserver(source.capturerObserver)
+                }
+            } else {
+                null
+            }
+
             capturer.initialize(
                 surfaceTextureHelper,
                 context,
-                source.capturerObserver,
+                dispatchObserver ?: source.capturerObserver,
             )
             val rtcTrack = peerConnectionFactory.createVideoTrack(UUID.randomUUID().toString(), source)
 
             val track = trackFactory.create(
                 capturer = capturer,
                 source = source,
-                options = newOptions,
+                options = options,
                 name = name,
                 rtcTrack = rtcTrack,
+                dispatchObserver = dispatchObserver,
             )
 
             track.closeableManager.registerResource(
                 rtcTrack,
                 SurfaceTextureHelperCloser(surfaceTextureHelper),
             )
-
             return track
         }
     }

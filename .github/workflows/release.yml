@@ -1,11 +1,7 @@
-name: Publish
+name: Manual Publish
 
 on:
   workflow_dispatch:
-  push:
-    # only publish on version tags
-    tags:
-      - v*
 
 jobs:
   publish:
@@ -40,7 +36,7 @@ jobs:
         AWS_DEFAULT_REGION: "us-east-1"
 
     - name: Build with Gradle
-      run: ./gradlew livekit-android-sdk:assembleRelease livekit-android-sdk:testRelease
+      run: ./gradlew livekit-android-sdk:assembleRelease livekit-android-camerax:assembleRelease livekit-android-test:testRelease
 
     - name: Create gpg key and import into gradle properties
       run: |
@@ -61,7 +57,7 @@ jobs:
         PROFILE_ID: ${{ secrets.STAGING_PROFILE_ID }}
 
     - name: Publish to sonatype
-      run: ./gradlew publish
+      run: ./gradlew publish -Dorg.gradle.parallel=false
 
     - name: Close and release to maven
       run: ./gradlew closeAndReleaseRepository

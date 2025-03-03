@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit, Inc.
+ * Copyright 2023-2024 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,20 @@
 
 package io.livekit.android.room
 
+import io.livekit.android.room.util.PeerConnectionStateObservable
+import io.livekit.android.util.FlowObservable
 import io.livekit.android.util.LKLog
+import io.livekit.android.util.flowDelegate
+import io.livekit.android.webrtc.peerconnection.executeOnRTCThread
 import livekit.LivekitRtc
-import org.webrtc.CandidatePairChangeEvent
-import org.webrtc.DataChannel
-import org.webrtc.IceCandidate
-import org.webrtc.MediaStream
-import org.webrtc.MediaStreamTrack
-import org.webrtc.PeerConnection
-import org.webrtc.RtpReceiver
-import org.webrtc.RtpTransceiver
+import livekit.org.webrtc.CandidatePairChangeEvent
+import livekit.org.webrtc.DataChannel
+import livekit.org.webrtc.IceCandidate
+import livekit.org.webrtc.MediaStream
+import livekit.org.webrtc.MediaStreamTrack
+import livekit.org.webrtc.PeerConnection
+import livekit.org.webrtc.RtpReceiver
+import livekit.org.webrtc.RtpTransceiver
 
 /**
  * @suppress
@@ -33,20 +37,29 @@ import org.webrtc.RtpTransceiver
 class SubscriberTransportObserver(
     private val engine: RTCEngine,
     private val client: SignalClient,
-) : PeerConnection.Observer {
+) : PeerConnection.Observer, PeerConnectionStateObservable {
 
     var dataChannelListener: ((DataChannel) -> Unit)? = null
-    var connectionChangeListener: ((PeerConnection.PeerConnectionState) -> Unit)? = null
+    var connectionChangeListener: PeerConnectionStateListener? = null
+
+    @FlowObservable
+    @get:FlowObservable
+    override var connectionState by flowDelegate(PeerConnection.PeerConnectionState.NEW)
+        private set
 
     override fun onIceCandidate(candidate: IceCandidate) {
-        LKLog.v { "onIceCandidate: $candidate" }
-        client.sendCandidate(candidate, LivekitRtc.SignalTarget.SUBSCRIBER)
+        executeOnRTCThread {
+            LKLog.v { "onIceCandidate: $candidate" }
+            client.sendCandidate(candidate, LivekitRtc.SignalTarget.SUBSCRIBER)
+        }
     }
 
     override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) {
-        val track = receiver.track() ?: return
-        LKLog.v { "onAddTrack: ${track.kind()}, ${track.id()}, ${streams.fold("") { sum, it -> "$sum, $it" }}" }
-        engine.listener?.onAddTrack(receiver, track, streams)
+        executeOnRTCThread {
+            val track = receiver.track() ?: return@executeOnRTCThread
+            LKLog.v { "onAddTrack: ${track.kind()}, ${track.id()}, ${streams.fold("") { sum, it -> "$sum, $it" }}" }
+            engine.listener?.onAddTrack(receiver, track, streams)
+        }
     }
 
     override fun onTrack(transceiver: RtpTransceiver) {
@@ -58,15 +71,20 @@ class SubscriberTransportObserver(
     }
 
     override fun onDataChannel(channel: DataChannel) {
-        dataChannelListener?.invoke(channel)
+        executeOnRTCThread {
+            dataChannelListener?.invoke(channel)
+        }
     }
 
     override fun onStandardizedIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
     }
 
     override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {
-        LKLog.v { "onConnectionChange new state: $newState" }
-        connectionChangeListener?.invoke(newState)
+        executeOnRTCThread {
+            LKLog.v { "onConnectionChange new state: $newState" }
+            connectionChangeListener?.invoke(newState)
+            connectionState = newState
+        }
     }
 
     override fun onSelectedCandidatePairChanged(event: CandidatePairChangeEvent?) {
